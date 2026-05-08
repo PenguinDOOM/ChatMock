@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import chatmock.cli as cli
+import chatmock.responses_api as responses_api
 from chatmock.app import create_app
 from chatmock.session import reset_session_state
 from websockets.sync.client import connect as ws_connect
@@ -206,6 +207,28 @@ class RouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(mock_start.call_args.kwargs["instructions"])
+
+    def test_instructions_for_model_returns_none_when_builtin_instructions_unset(self) -> None:
+        instructions = responses_api.instructions_for_model(
+            {
+                "BASE_INSTRUCTIONS": None,
+                "GPT5_CODEX_INSTRUCTIONS": None,
+            },
+            "gpt-5.4",
+        )
+
+        self.assertIsNone(instructions)
+
+    def test_instructions_for_model_codex_returns_none_when_builtin_instructions_unset(self) -> None:
+        instructions = responses_api.instructions_for_model(
+            {
+                "BASE_INSTRUCTIONS": None,
+                "GPT5_CODEX_INSTRUCTIONS": None,
+            },
+            "gpt-5.3-codex",
+        )
+
+        self.assertIsNone(instructions)
 
     @patch("chatmock.routes_openai.start_upstream_request")
     def test_chat_completions_always_mode_injects_builtin_instructions(self, mock_start) -> None:
