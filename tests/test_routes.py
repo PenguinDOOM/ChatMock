@@ -133,6 +133,81 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(body["model"], "gpt5.4-mini")
 
     @patch("chatmock.routes_openai.start_upstream_request")
+    def test_completions_always_mode_injects_builtin_instructions(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="always")
+        app.config["BASE_INSTRUCTIONS"] = "built-in completions instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"id": "resp-openai"}},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={"model": "gpt-5.4", "prompt": "hi"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            mock_start.call_args.kwargs["instructions"],
+            "built-in completions instructions",
+        )
+
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_completions_fallback_mode_injects_builtin_instructions(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="fallback")
+        app.config["BASE_INSTRUCTIONS"] = "built-in completions instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"id": "resp-openai"}},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={"model": "gpt-5.4", "prompt": "hi"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            mock_start.call_args.kwargs["instructions"],
+            "built-in completions instructions",
+        )
+
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_completions_off_mode_sends_no_builtin_instructions(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="off")
+        app.config["BASE_INSTRUCTIONS"] = "built-in completions instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"id": "resp-openai"}},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={"model": "gpt-5.4", "prompt": "hi"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(mock_start.call_args.kwargs["instructions"])
+
+    @patch("chatmock.routes_openai.start_upstream_request")
     def test_chat_completions_always_mode_injects_builtin_instructions(self, mock_start) -> None:
         app = create_app(base_instructions_mode="always")
         app.config["BASE_INSTRUCTIONS"] = "built-in openai instructions"

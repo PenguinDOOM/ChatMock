@@ -81,6 +81,13 @@ def _instructions_for_model(
     route_name: str | None = None,
 ) -> str | None:
     if payload is not None and route_name is not None:
+        if route_name == "/v1/completions":
+            # Legacy completions has no route-level instructions field, so fallback
+            # behaves like always while off still suppresses built-in instructions.
+            mode = str(current_app.config.get("BASE_INSTRUCTIONS_MODE") or "fallback").strip().lower()
+            if mode == "off":
+                return None
+            return resolve_builtin_instructions(current_app.config, model)
         # For chat-style routes, fallback mode treats an explicit system message as client instructions.
         if not should_inject_base_instructions(
             current_app.config,
@@ -407,7 +414,11 @@ def completions() -> Response:
     upstream, error_resp = start_upstream_request(
         model,
         input_items,
-        instructions=_instructions_for_model(model),
+        instructions=_instructions_for_model(
+            model,
+            payload=payload,
+            route_name="/v1/completions",
+        ),
         reasoning_param=reasoning_param,
         service_tier=service_tier,
     )
