@@ -76,9 +76,8 @@ def resolve_builtin_instructions(config: Dict[str, Any], model: str) -> str | No
     return resolved_base
 
 
-def instructions_for_model(config: Dict[str, Any], model: str) -> str:
-    instructions = resolve_builtin_instructions(config, model)
-    return instructions or ""
+def instructions_for_model(config: Dict[str, Any], model: str) -> str | None:
+    return resolve_builtin_instructions(config, model)
 
 
 def extract_client_session_id(headers: Any) -> str | None:
