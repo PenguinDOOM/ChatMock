@@ -50,6 +50,10 @@ def should_inject_base_instructions(
         return True
     if route_name == "/v1/responses":
         return "instructions" not in payload
+    if route_name == "/v1/completions":
+        # Legacy completions has no route-level instructions override, so
+        # fallback should still inject the built-in instructions.
+        return True
     if route_name in {"/v1/chat/completions", "/api/chat"}:
         messages = payload.get("messages")
         if not isinstance(messages, list):
