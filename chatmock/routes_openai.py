@@ -6,7 +6,6 @@ from typing import Any, Dict, List
 
 from flask import Blueprint, Response, current_app, jsonify, make_response, request
 
-from .config import BASE_INSTRUCTIONS, GPT5_CODEX_INSTRUCTIONS
 from .fast_mode import resolve_service_tier
 from .limits import record_rate_limits_from_response
 from .http import build_cors_headers
@@ -17,6 +16,8 @@ from .responses_api import (
     extract_client_session_id,
     instructions_for_model,
     normalize_responses_payload,
+    resolve_builtin_instructions,
+    should_inject_base_instructions,
     stream_upstream_bytes,
 )
 from .reasoning import (
@@ -73,7 +74,21 @@ def _wrap_stream_logging(label: str, iterator, enabled: bool):
     return _gen()
 
 
-def _instructions_for_model(model: str) -> str:
+def _instructions_for_model(
+    model: str,
+    *,
+    payload: Dict[str, Any] | None = None,
+    route_name: str | None = None,
+) -> str | None:
+    if payload is not None and route_name is not None:
+        # For chat-style routes, fallback mode treats an explicit system message as client instructions.
+        if not should_inject_base_instructions(
+            current_app.config,
+            route_name=route_name,
+            payload=payload,
+        ):
+            return None
+        return resolve_builtin_instructions(current_app.config, model)
     return instructions_for_model(current_app.config, model)
 
 
@@ -142,6 +157,12 @@ def chat_completions() -> Response:
             _log_json("OUT POST /v1/chat/completions", err)
         return jsonify(err), 400
 
+    request_instructions = _instructions_for_model(
+        model,
+        payload=payload,
+        route_name="/v1/chat/completions",
+    )
+
     if isinstance(messages, list):
         sys_idx = next((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"), None)
         if isinstance(sys_idx, int):
@@ -155,48 +176,6 @@ def chat_completions() -> Response:
     tools_responses = convert_tools_chat_to_responses(payload.get("tools"))
     tool_choice = payload.get("tool_choice", "auto")
     parallel_tool_calls = bool(payload.get("parallel_tool_calls", False))
-    responses_tools_payload = payload.get("responses_tools") if isinstance(payload.get("responses_tools"), list) else []
-    extra_tools: List[Dict[str, Any]] = []
-    had_responses_tools = False
-    if isinstance(responses_tools_payload, list):
-        for _t in responses_tools_payload:
-            if not (isinstance(_t, dict) and isinstance(_t.get("type"), str)):
-                continue
-            if _t.get("type") not in ("web_search", "web_search_preview"):
-                err = {
-                    "error": {
-                        "message": "Only web_search/web_search_preview are supported in responses_tools",
-                        "code": "RESPONSES_TOOL_UNSUPPORTED",
-                    }
-                }
-                if verbose:
-                    _log_json("OUT POST /v1/chat/completions", err)
-                return jsonify(err), 400
-            extra_tools.append(_t)
-
-        if not extra_tools and bool(current_app.config.get("DEFAULT_WEB_SEARCH")):
-            responses_tool_choice = payload.get("responses_tool_choice")
-            if not (isinstance(responses_tool_choice, str) and responses_tool_choice == "none"):
-                extra_tools = [{"type": "web_search"}]
-
-        if extra_tools:
-            import json as _json
-            MAX_TOOLS_BYTES = 32768
-            try:
-                size = len(_json.dumps(extra_tools))
-            except Exception:
-                size = 0
-            if size > MAX_TOOLS_BYTES:
-                err = {"error": {"message": "responses_tools too large", "code": "RESPONSES_TOOLS_TOO_LARGE"}}
-                if verbose:
-                    _log_json("OUT POST /v1/chat/completions", err)
-                return jsonify(err), 400
-            had_responses_tools = True
-            tools_responses = (tools_responses or []) + extra_tools
-
-    responses_tool_choice = payload.get("responses_tool_choice")
-    if isinstance(responses_tool_choice, str) and responses_tool_choice in ("auto", "none"):
-        tool_choice = responses_tool_choice
 
     input_items = convert_chat_messages_to_responses_input(messages)
     if not input_items and isinstance(payload.get("prompt"), str) and payload.get("prompt").strip():
@@ -219,7 +198,7 @@ def chat_completions() -> Response:
     upstream, error_resp = start_upstream_request(
         model,
         input_items,
-        instructions=_instructions_for_model(model),
+        instructions=request_instructions,
         tools=tools_responses,
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
@@ -249,41 +228,12 @@ def chat_completions() -> Response:
             err_body = json.loads(raw.decode("utf-8", errors="ignore")) if raw else {"raw": upstream.text}
         except Exception:
             err_body = {"raw": upstream.text}
-        if had_responses_tools:
-            if verbose:
-                print("[Passthrough] Upstream rejected tools; retrying without extra tools (args redacted)")
-            base_tools_only = convert_tools_chat_to_responses(payload.get("tools"))
-            safe_choice = payload.get("tool_choice", "auto")
-            upstream2, err2 = start_upstream_request(
-                model,
-                input_items,
-                instructions=BASE_INSTRUCTIONS,
-                tools=base_tools_only,
-                tool_choice=safe_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                reasoning_param=reasoning_param,
-                service_tier=service_tier,
-            )
-            record_rate_limits_from_response(upstream2)
-            if err2 is None and upstream2 is not None and upstream2.status_code < 400:
-                upstream = upstream2
-            else:
-                err = {
-                    "error": {
-                        "message": (err_body.get("error", {}) or {}).get("message", "Upstream error"),
-                        "code": "RESPONSES_TOOLS_REJECTED",
-                    }
-                }
-                if verbose:
-                    _log_json("OUT POST /v1/chat/completions", err)
-                return jsonify(err), (upstream2.status_code if upstream2 is not None else upstream.status_code)
-        else:
-            if verbose:
-                print("Upstream error status=", upstream.status_code)
-            err = {"error": {"message": (err_body.get("error", {}) or {}).get("message", "Upstream error")}}
-            if verbose:
-                _log_json("OUT POST /v1/chat/completions", err)
-            return jsonify(err), upstream.status_code
+        if verbose:
+            print("Upstream error status=", upstream.status_code)
+        err = {"error": {"message": (err_body.get("error", {}) or {}).get("message", "Upstream error")}}
+        if verbose:
+            _log_json("OUT POST /v1/chat/completions", err)
+        return jsonify(err), upstream.status_code
 
     if is_stream:
         if verbose:

@@ -41,13 +41,25 @@ def should_inject_base_instructions(
     route_name: str,
     payload: Dict[str, Any],
 ) -> bool:
-    if route_name != "/v1/responses":
-        return False
-    # Phase 2 keeps explicit client instructions on /v1/responses in every mode.
-    if "instructions" in payload:
+    if route_name == "/v1/responses" and "instructions" in payload:
         return False
     mode = str(config.get("BASE_INSTRUCTIONS_MODE") or "fallback").strip().lower()
-    return mode in {"always", "fallback"}
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    if route_name == "/v1/responses":
+        return "instructions" not in payload
+    if route_name in {"/v1/chat/completions", "/api/chat"}:
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return True
+        return not any(
+            isinstance(message, dict)
+            and str(message.get("role") or "").strip().lower() == "system"
+            for message in messages
+        )
+    return False
 
 
 def resolve_builtin_instructions(config: Dict[str, Any], model: str) -> str | None:

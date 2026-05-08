@@ -133,6 +133,133 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(body["model"], "gpt5.4-mini")
 
     @patch("chatmock.routes_openai.start_upstream_request")
+    def test_chat_completions_always_mode_injects_builtin_instructions(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="always")
+        app.config["BASE_INSTRUCTIONS"] = "built-in openai instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"id": "resp-openai"}},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            mock_start.call_args.kwargs["instructions"],
+            "built-in openai instructions",
+        )
+
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_chat_completions_fallback_mode_skips_builtin_instructions_for_system_message(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="fallback")
+        app.config["BASE_INSTRUCTIONS"] = "built-in openai instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"id": "resp-openai"}},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.4",
+                "messages": [
+                    {"role": "system", "content": "client system prompt"},
+                    {"role": "user", "content": "hi"},
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(mock_start.call_args.kwargs["instructions"])
+
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_chat_completions_off_mode_sends_no_builtin_instructions(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="off")
+        app.config["BASE_INSTRUCTIONS"] = "built-in openai instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"id": "resp-openai"}},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(mock_start.call_args.kwargs["instructions"])
+
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_chat_completions_preserves_upstream_json_error_object(self, mock_start) -> None:
+        upstream_error = {
+            "error": {
+                "message": "Unknown tool: tool_search",
+                "type": "invalid_request_error",
+                "param": "tools[0].name",
+                "code": "unknown_tool",
+            }
+        }
+        mock_start.return_value = (
+            FakeUpstream(
+                status_code=400,
+                content=json.dumps(upstream_error).encode("utf-8"),
+                text=json.dumps(upstream_error),
+            ),
+            None,
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json(), upstream_error)
+
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_chat_completions_preserve_unknown_model_id(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"id": "resp-openai"}},
+                ]
+            ),
+            None,
+        )
+        requested_model = "unknown-model-xyz"
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": requested_model, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        normalized_model = mock_start.call_args.args[0]
+        self.assertEqual(normalized_model, requested_model)
+
+    @patch("chatmock.routes_openai.start_upstream_request")
     def test_chat_completions_honors_debug_model_override(self, mock_start) -> None:
         app = create_app(debug_model="gpt-5.4")
         client = app.test_client()
@@ -171,6 +298,85 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body["message"]["content"], "hello")
         self.assertEqual(body["model"], "gpt-5.4")
+
+    @patch("chatmock.routes_ollama.start_upstream_request")
+    def test_ollama_chat_always_mode_injects_builtin_instructions(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="always")
+        app.config["BASE_INSTRUCTIONS"] = "built-in ollama instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed"},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/api/chat",
+            json={"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            mock_start.call_args.kwargs["instructions"],
+            "built-in ollama instructions",
+        )
+
+    @patch("chatmock.routes_ollama.start_upstream_request")
+    def test_ollama_chat_fallback_mode_skips_builtin_instructions_for_system_message(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="fallback")
+        app.config["BASE_INSTRUCTIONS"] = "built-in ollama instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed"},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/api/chat",
+            json={
+                "model": "gpt-5.4",
+                "messages": [
+                    {"role": "system", "content": "client system prompt"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "stream": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(mock_start.call_args.kwargs["instructions"])
+
+    @patch("chatmock.routes_ollama.start_upstream_request")
+    def test_ollama_chat_off_mode_sends_no_builtin_instructions(self, mock_start) -> None:
+        app = create_app(base_instructions_mode="off")
+        app.config["BASE_INSTRUCTIONS"] = "built-in ollama instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed"},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/api/chat",
+            json={"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(mock_start.call_args.kwargs["instructions"])
 
     @patch("chatmock.routes_ollama.start_upstream_request")
     def test_ollama_chat_honors_debug_model_override(self, mock_start) -> None:
