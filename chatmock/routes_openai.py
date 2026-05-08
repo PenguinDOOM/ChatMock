@@ -162,7 +162,7 @@ def chat_completions() -> Response:
         route_name="/v1/chat/completions",
     )
 
-    if isinstance(messages, list):
+    if isinstance(messages, list) and request_instructions is None:
         sys_idx = next((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"), None)
         if isinstance(sys_idx, int):
             sys_msg = messages.pop(sys_idx)
@@ -176,7 +176,10 @@ def chat_completions() -> Response:
     tool_choice = payload.get("tool_choice", "auto")
     parallel_tool_calls = bool(payload.get("parallel_tool_calls", False))
 
-    input_items = convert_chat_messages_to_responses_input(messages)
+    input_items = convert_chat_messages_to_responses_input(
+        messages,
+        preserve_system_messages=request_instructions is not None,
+    )
     if not input_items and isinstance(payload.get("prompt"), str) and payload.get("prompt").strip():
         input_items = [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": payload.get("prompt")}]}
