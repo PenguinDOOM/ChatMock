@@ -225,14 +225,18 @@ def chat_completions() -> Response:
 
     created = int(time.time())
     if upstream.status_code >= 400:
+        parsed_err_body = None
         try:
             raw = upstream.content
-            err_body = json.loads(raw.decode("utf-8", errors="ignore")) if raw else {"raw": upstream.text}
+            parsed_err_body = json.loads(raw.decode("utf-8", errors="ignore")) if raw else None
         except Exception:
-            err_body = {"raw": upstream.text}
+            parsed_err_body = None
         if verbose:
             print("Upstream error status=", upstream.status_code)
-        err = {"error": {"message": (err_body.get("error", {}) or {}).get("message", "Upstream error")}}
+        if isinstance(parsed_err_body, dict):
+            err = parsed_err_body
+        else:
+            err = {"error": {"message": "Upstream error"}}
         if verbose:
             _log_json("OUT POST /v1/chat/completions", err)
         return jsonify(err), upstream.status_code
