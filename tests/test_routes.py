@@ -389,7 +389,7 @@ class RouteTests(unittest.TestCase):
     def test_chat_completions_preserves_upstream_json_error_object(self, mock_start) -> None:
         upstream_error = {
             "error": {
-                "message": "Unknown tool: tool_search",
+                "message": "Unknown tool name",
                 "type": "invalid_request_error",
                 "param": "tools[0].name",
                 "code": "unknown_tool",
