@@ -140,6 +140,8 @@ def normalize_responses_payload(
         instructions = resolve_builtin_instructions(config, normalized_model)
         if instructions is not None:
             normalized["instructions"] = instructions
+    if "instructions" not in normalized:
+        normalized["instructions"] = ""
 
     reasoning_effort = config.get("REASONING_EFFORT", "medium")
     reasoning_summary = config.get("REASONING_SUMMARY", "auto")

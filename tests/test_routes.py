@@ -792,7 +792,7 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(outbound_payload["instructions"], "server base instructions")
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
-    def test_responses_route_off_mode_does_not_inject_builtin_instructions(self, mock_start) -> None:
+    def test_responses_route_off_mode_sends_empty_instructions_placeholder(self, mock_start) -> None:
         app = create_app(base_instructions_mode="off")
         app.config["BASE_INSTRUCTIONS"] = "server base instructions"
         app.config["GPT5_CODEX_INSTRUCTIONS"] = "server codex instructions"
@@ -826,7 +826,7 @@ class RouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         outbound_payload = mock_start.call_args.args[0]
-        self.assertNotIn("instructions", outbound_payload)
+        self.assertEqual(outbound_payload["instructions"], "")
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_preserves_explicit_empty_instructions(self, mock_start) -> None:
@@ -903,7 +903,9 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(outbound_payload["instructions"], "client instructions")
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
-    def test_responses_route_accepts_missing_or_empty_builtin_instruction_config(self, mock_start) -> None:
+    def test_responses_route_sends_empty_instructions_when_builtin_instruction_config_is_missing_or_empty(
+        self, mock_start
+    ) -> None:
         for base_instructions, codex_instructions in ((None, None), ("", "")):
             with self.subTest(base_instructions=base_instructions, codex_instructions=codex_instructions):
                 app = create_app(base_instructions_mode="fallback")
@@ -944,7 +946,7 @@ class RouteTests(unittest.TestCase):
 
                 self.assertEqual(response.status_code, 200)
                 outbound_payload = mock_start.call_args.args[0]
-                self.assertNotIn("instructions", outbound_payload)
+                self.assertEqual(outbound_payload["instructions"], "")
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_honors_debug_model_override(self, mock_start) -> None:
