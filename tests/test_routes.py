@@ -501,6 +501,84 @@ class RouteTests(unittest.TestCase):
         )
 
     @patch("chatmock.routes_ollama.start_upstream_request")
+    def test_ollama_chat_always_mode_injects_builtin_instructions_even_with_system_message(
+        self, mock_start
+    ) -> None:
+        app = create_app(base_instructions_mode="always")
+        app.config["BASE_INSTRUCTIONS"] = "built-in ollama instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed"},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/api/chat",
+            json={
+                "model": "gpt-5.4",
+                "messages": [
+                    {"role": "system", "content": "client system prompt"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "stream": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            mock_start.call_args.kwargs["instructions"],
+            "built-in ollama instructions",
+        )
+        self.assertEqual(
+            mock_start.call_args.args[1],
+            [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "client system prompt"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            ],
+        )
+
+    @patch("chatmock.routes_ollama.start_upstream_request")
+    def test_ollama_chat_fallback_mode_injects_builtin_instructions_without_system_message(
+        self, mock_start
+    ) -> None:
+        app = create_app(base_instructions_mode="fallback")
+        app.config["BASE_INSTRUCTIONS"] = "built-in ollama instructions"
+        client = app.test_client()
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed"},
+                ]
+            ),
+            None,
+        )
+
+        response = client.post(
+            "/api/chat",
+            json={"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            mock_start.call_args.kwargs["instructions"],
+            "built-in ollama instructions",
+        )
+
+    @patch("chatmock.routes_ollama.start_upstream_request")
     def test_ollama_chat_fallback_mode_skips_builtin_instructions_for_system_message(self, mock_start) -> None:
         app = create_app(base_instructions_mode="fallback")
         app.config["BASE_INSTRUCTIONS"] = "built-in ollama instructions"

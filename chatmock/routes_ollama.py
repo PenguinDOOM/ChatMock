@@ -206,12 +206,6 @@ def ollama_chat() -> Response:
     messages = convert_ollama_messages(
         raw_messages, payload.get("images") if isinstance(payload.get("images"), list) else None
     )
-    if isinstance(messages, list):
-        sys_idx = next((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"), None)
-        if isinstance(sys_idx, int):
-            sys_msg = messages.pop(sys_idx)
-            content = sys_msg.get("content") if isinstance(sys_msg, dict) else ""
-            messages.insert(0, {"role": "user", "content": content})
     stream_req = payload.get("stream")
     if stream_req is None:
         stream_req = True
@@ -226,8 +220,6 @@ def ollama_chat() -> Response:
         if verbose:
             _log_json("OUT POST /api/chat", err)
         return jsonify(err), 400
-
-    input_items = convert_chat_messages_to_responses_input(messages)
 
     model_reasoning = extract_reasoning_from_model_name(model)
     normalized_model = normalize_model_name(model, current_app.config.get("DEBUG_MODEL"))
@@ -248,6 +240,17 @@ def ollama_chat() -> Response:
         normalized_model,
         payload=payload,
         route_name="/api/chat",
+    )
+    if request_instructions is None:
+        sys_idx = next((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"), None)
+        if isinstance(sys_idx, int):
+            sys_msg = messages.pop(sys_idx)
+            content = sys_msg.get("content") if isinstance(sys_msg, dict) else ""
+            messages.insert(0, {"role": "user", "content": content})
+
+    input_items = convert_chat_messages_to_responses_input(
+        messages,
+        preserve_system_messages=request_instructions is not None,
     )
     upstream, error_resp = start_upstream_request(
         normalized_model,
