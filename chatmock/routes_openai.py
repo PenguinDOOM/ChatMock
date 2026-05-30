@@ -6,6 +6,8 @@ from typing import Any, Dict, List
 
 from flask import Blueprint, Response, current_app, jsonify, make_response, request
 
+from . import responses_websocket_bridge
+from .config import BASE_INSTRUCTIONS, GPT5_CODEX_INSTRUCTIONS
 from .fast_mode import resolve_service_tier
 from .limits import record_rate_limits_from_response
 from .http import build_cors_headers
@@ -42,6 +44,21 @@ from .utils import (
 
 
 openai_bp = Blueprint("openai", __name__)
+
+
+def _stateful_http_responses_bridge_enabled() -> bool:
+    # Ordinary HTTP and the one-shot bridge stay stateless. The opt-in stateful
+    # bridge is the only HTTP branch that enables previous_response_id reuse.
+    return bool(current_app.config.get("RESPONSES_WEBSOCKET_UPSTREAM")) and bool(
+        current_app.config.get("RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL")
+    )
+
+
+def _error_json_response(message: str, status_code: int) -> Response:
+    resp = make_response(jsonify({"error": {"message": message}}), status_code)
+    for k, v in build_cors_headers().items():
+        resp.headers.setdefault(k, v)
+    return resp
 
 
 def _log_json(prefix: str, payload: Any) -> None:
@@ -534,6 +551,7 @@ def completions() -> Response:
 @openai_bp.route("/v1/responses", methods=["POST"])
 def responses_create() -> Response:
     verbose = bool(current_app.config.get("VERBOSE"))
+    stateful_http_bridge_enabled = _stateful_http_responses_bridge_enabled()
     raw = request.get_data(cache=True, as_text=True) or ""
     if verbose:
         try:
@@ -555,11 +573,13 @@ def responses_create() -> Response:
             _log_json("OUT POST /v1/responses", err)
         return jsonify(err), 400
 
+    client_session_id = extract_client_session_id(request.headers)
+
     try:
         normalized = normalize_responses_payload(
             payload,
             config=current_app.config,
-            client_session_id=extract_client_session_id(request.headers),
+            client_session_id=client_session_id,
         )
     except ResponsesRequestError as exc:
         err: Dict[str, Any] = {"error": {"message": str(exc)}}
@@ -572,16 +592,45 @@ def responses_create() -> Response:
     if normalized.service_tier_resolution.warning_message and verbose:
         print(f"[FastMode] {normalized.service_tier_resolution.warning_message}")
 
-    prepared = prepare_responses_request_for_session(
-        normalized.session_id,
-        normalized.payload,
-        allow_previous_response_id=False,
+    previous_response_id = normalized.payload.get("previous_response_id")
+    explicit_previous_response_id = (
+        isinstance(previous_response_id, str)
+        and bool(previous_response_id.strip())
     )
-    stream_req = bool(prepared.payload.get("stream", False))
-    upstream_payload = dict(prepared.payload)
-    upstream_payload["stream"] = True
+    if stateful_http_bridge_enabled:
+        prepared_payload = dict(normalized.payload)
+        if not explicit_previous_response_id:
+            prepared_payload.pop("previous_response_id", None)
+    else:
+        prepared = prepare_responses_request_for_session(
+            normalized.session_id,
+            normalized.payload,
+            allow_previous_response_id=False,
+        )
+        prepared_payload = dict(prepared.payload)
+        explicit_previous_response_id = bool(
+            getattr(prepared, "explicit_previous_response_id", False)
+        )
+
+    stream_req = bool(prepared_payload.get("stream", False))
+    upstream_request_payload = dict(prepared_payload)
+    upstream_request_payload["stream"] = True
+    if bool(current_app.config.get("RESPONSES_WEBSOCKET_UPSTREAM")):
+        # The HTTP bridge owns one upstream websocket per HTTP request.
+        return responses_websocket_bridge.send_responses_request_via_websocket(
+            payload=upstream_request_payload,
+            session_id=normalized.session_id,
+            stream=stream_req,
+            verbose=verbose,
+            stateful=stateful_http_bridge_enabled,
+            explicit_previous_response_id=explicit_previous_response_id,
+            max_retained_sessions=current_app.config.get(
+                "RESPONSES_WEBSOCKET_UPSTREAM_MAX_RETAINED_SESSIONS"
+            ),
+        )
+
     upstream, error_resp = start_upstream_raw_request(
-        upstream_payload,
+        upstream_request_payload,
         session_id=normalized.session_id,
         stream=True,
     )
