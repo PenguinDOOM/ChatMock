@@ -182,6 +182,11 @@ All flags go after `chatmock serve`. These can also be set as environment variab
 - If the websocket upstream path fails, the request fails clearly instead of silently falling back to the legacy HTTP POST upstream transport.
 - Rollback is a config change only: disable `--responses-websocket-upstream-stateful` and ChatMock returns to the existing one-shot websocket-bridge behavior.
 
+Verbose logging note:
+- Verified for the serve workflow with `--responses-websocket-upstream --responses-websocket-upstream-stateful --verbose` only.
+- Request verbose diagnostics are written to stdout, so `chatmock serve --responses-websocket-upstream --responses-websocket-upstream-stateful --verbose > log.txt` captures those request logs.
+- `chatmock serve --responses-websocket-upstream --responses-websocket-upstream-stateful --verbose > log.txt 2>&1` captures the same request verbose logs plus Flask/Werkzeug stderr output.
+
 Manual verification:
 1. Default-off regression: start `chatmock serve --responses-websocket-upstream` without `--responses-websocket-upstream-stateful`, then send two HTTP `/v1/responses` requests with the same optional `X-Session-Id`. Example prompts: first `Remember the token ALPHA-42.`, then `What token did I ask you to remember?`. Confirm the second request behaves like a fresh one-shot request rather than a retained follow-up.
 2. Stateful mode: restart with both `--responses-websocket-upstream` and `--responses-websocket-upstream-stateful`, then send a first HTTP `/v1/responses` request without `previous_response_id`. Optionally send a blank `X-Session-Id` or `session_id` header and confirm it does not block the request.
