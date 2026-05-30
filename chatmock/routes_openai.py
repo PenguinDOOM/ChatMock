@@ -35,6 +35,7 @@ from .session import (
     prepare_responses_request_for_session,
 )
 from .upstream import normalize_model_name, start_upstream_raw_request, start_upstream_request
+from .upstream_errors import build_upstream_error
 from .utils import (
     convert_chat_messages_to_responses_input,
     convert_tools_chat_to_responses,
@@ -55,7 +56,12 @@ def _stateful_http_responses_bridge_enabled() -> bool:
 
 
 def _error_json_response(message: str, status_code: int) -> Response:
-    resp = make_response(jsonify({"error": {"message": message}}), status_code)
+    resp = _json_response_with_cors({"error": {"message": message}}, status_code)
+    return resp
+
+
+def _json_response_with_cors(payload: Any, status_code: int) -> Response:
+    resp = make_response(jsonify(payload), status_code)
     for k, v in build_cors_headers().items():
         resp.headers.setdefault(k, v)
     return resp
@@ -89,6 +95,46 @@ def _wrap_stream_logging(label: str, iterator, enabled: bool):
             yield chunk
 
     return _gen()
+
+
+class _SSEInspectionProxy:
+    def __init__(self, upstream: Any) -> None:
+        self._upstream = upstream
+        self.completed_seen = False
+        self.invalid_event_data: str | None = None
+        self.last_event_data: str | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._upstream, name)
+
+    def iter_lines(self, decode_unicode: bool = False):
+        for raw in self._upstream.iter_lines(decode_unicode=False):
+            text = (
+                raw.decode("utf-8", errors="ignore")
+                if isinstance(raw, (bytes, bytearray))
+                else str(raw)
+            )
+            self._inspect_line(text)
+            if decode_unicode:
+                yield text
+            else:
+                yield raw
+
+    def _inspect_line(self, line: str) -> None:
+        if not line.startswith("data: "):
+            return
+        data = line[len("data: ") :].strip()
+        if not data or data == "[DONE]":
+            return
+        self.last_event_data = data
+        try:
+            event = json.loads(data)
+        except Exception:
+            if self.invalid_event_data is None:
+                self.invalid_event_data = data
+            return
+        if isinstance(event, dict) and event.get("type") == "response.completed":
+            self.completed_seen = True
 
 
 def _instructions_for_model(
@@ -141,17 +187,17 @@ def chat_completions() -> Response:
     reasoning_summary = current_app.config.get("REASONING_SUMMARY", "auto")
     reasoning_compat = current_app.config.get("REASONING_COMPAT", "think-tags")
 
-    raw = request.get_data(cache=True, as_text=True) or ""
+    request_body_text = request.get_data(cache=True, as_text=True) or ""
     if verbose:
         try:
-            print("IN POST /v1/chat/completions\n" + raw)
+            print("IN POST /v1/chat/completions\n" + request_body_text)
         except Exception:
             pass
     try:
-        payload = json.loads(raw) if raw else {}
+        payload = json.loads(request_body_text) if request_body_text else {}
     except Exception:
         try:
-            payload = json.loads(raw.replace("\r", "").replace("\n", ""))
+            payload = json.loads(request_body_text.replace("\r", "").replace("\n", ""))
         except Exception:
             err = {"error": {"message": "Invalid JSON body"}}
             if verbose:
@@ -243,20 +289,32 @@ def chat_completions() -> Response:
     created = int(time.time())
     if upstream.status_code >= 400:
         parsed_err_body = None
+        upstream_body_bytes = upstream.content if upstream.content else None
+        upstream_body_text = upstream.text if not upstream_body_bytes else None
         try:
-            raw = upstream.content
-            parsed_err_body = json.loads(raw.decode("utf-8", errors="ignore")) if raw else None
+            parsed_err_body = (
+                json.loads(upstream_body_bytes.decode("utf-8", errors="ignore"))
+                if upstream_body_bytes
+                else None
+            )
         except Exception:
             parsed_err_body = None
+        finally:
+            upstream.close()
         if verbose:
             print("Upstream error status=", upstream.status_code)
         if isinstance(parsed_err_body, dict):
             err = parsed_err_body
         else:
-            err = {"error": {"message": "Upstream error"}}
+            err = build_upstream_error(
+                "Upstream error",
+                status_code=upstream.status_code,
+                content_type=upstream.headers.get("Content-Type"),
+                body=upstream_body_bytes or upstream_body_text,
+            )
         if verbose:
             _log_json("OUT POST /v1/chat/completions", err)
-        return jsonify(err), upstream.status_code
+        return _json_response_with_cors(err, upstream.status_code)
 
     if is_stream:
         if verbose:
@@ -650,21 +708,27 @@ def responses_create() -> Response:
         return error_resp
 
     record_rate_limits_from_response(upstream)
+    content_type = upstream.headers.get("Content-Type", "")
 
     if upstream.status_code >= 400:
+        raw = upstream.content if upstream.content else None
         try:
-            err_body = json.loads(upstream.content.decode("utf-8", errors="ignore")) if upstream.content else {"error": {"message": upstream.text}}
+            err_body = json.loads(raw.decode("utf-8", errors="ignore")) if raw else None
         except Exception:
-            err_body = {"error": {"message": upstream.text or "Upstream error"}}
+            err_body = None
         finally:
             upstream.close()
+        if not isinstance(err_body, dict):
+            err_body = build_upstream_error(
+                "Upstream error",
+                status_code=upstream.status_code,
+                content_type=content_type,
+                body=raw or upstream.text,
+            )
         clear_responses_reuse_state(normalized.session_id)
         if verbose:
             _log_json("OUT POST /v1/responses", err_body)
-        resp = make_response(jsonify(err_body), upstream.status_code)
-        for k, v in build_cors_headers().items():
-            resp.headers.setdefault(k, v)
-        return resp
+        return _json_response_with_cors(err_body, upstream.status_code)
 
     if stream_req:
         if verbose:
@@ -687,7 +751,6 @@ def responses_create() -> Response:
             resp.headers.setdefault(k, v)
         return resp
 
-    content_type = upstream.headers.get("Content-Type", "")
     if "application/json" in content_type.lower():
         try:
             body = upstream.json()
@@ -704,35 +767,47 @@ def responses_create() -> Response:
                 resp.headers.setdefault(k, v)
             return resp
 
+    inspected_upstream = _SSEInspectionProxy(upstream)
     response_obj, error_obj = aggregate_response_from_sse(
-        upstream,
+        inspected_upstream,
         on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt),
     )
     if error_obj is not None:
+        formatted_error = error_obj
+        if not (
+            isinstance(error_obj, dict)
+            and isinstance(error_obj.get("error"), dict)
+            and (
+                error_obj["error"].get("message") != "response.failed"
+                or len(error_obj["error"]) > 1
+            )
+        ):
+            formatted_error = build_upstream_error(
+                "Upstream response failed",
+                phase="response.failed",
+                content_type=content_type,
+                body=inspected_upstream.invalid_event_data or inspected_upstream.last_event_data,
+            )
         clear_responses_reuse_state(normalized.session_id)
         if verbose:
-            _log_json("OUT POST /v1/responses", error_obj)
-        resp = make_response(jsonify(error_obj), 502)
-        for k, v in build_cors_headers().items():
-            resp.headers.setdefault(k, v)
-        return resp
+            _log_json("OUT POST /v1/responses", formatted_error)
+        return _json_response_with_cors(formatted_error, 502)
 
-    if response_obj is None:
+    if response_obj is None or not inspected_upstream.completed_seen:
         clear_responses_reuse_state(normalized.session_id)
-        err = {"error": {"message": "Upstream response stream did not contain a completed response object"}}
+        err = build_upstream_error(
+            "Upstream response stream did not contain a completed response object",
+            phase="response.completed",
+            content_type=content_type,
+            body=inspected_upstream.invalid_event_data or inspected_upstream.last_event_data,
+        )
         if verbose:
             _log_json("OUT POST /v1/responses", err)
-        resp = make_response(jsonify(err), 502)
-        for k, v in build_cors_headers().items():
-            resp.headers.setdefault(k, v)
-        return resp
+        return _json_response_with_cors(err, 502)
 
     if verbose:
         _log_json("OUT POST /v1/responses", response_obj)
-    resp = make_response(jsonify(response_obj), upstream.status_code)
-    for k, v in build_cors_headers().items():
-        resp.headers.setdefault(k, v)
-    return resp
+    return _json_response_with_cors(response_obj, upstream.status_code)
 
 
 @openai_bp.route("/v1/models", methods=["GET"])

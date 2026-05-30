@@ -16,6 +16,7 @@ from .config import CHATGPT_RESPONSES_URL
 from .http import build_cors_headers
 from .model_registry import normalize_model_name
 from .session import ensure_session_id
+from .upstream_errors import build_upstream_error
 from flask import request as flask_request
 from .utils import get_effective_chatgpt_auth
 
@@ -168,7 +169,15 @@ def start_upstream_raw_request(
             timeout=600,
         )
     except requests.RequestException as e:
-        resp = make_response(jsonify({"error": {"message": f"Upstream ChatGPT request failed: {e}"}}), 502)
+        resp = make_response(
+            jsonify(
+                build_upstream_error(
+                    "Upstream ChatGPT request failed",
+                    exception=e,
+                )
+            ),
+            502,
+        )
         for k, v in build_cors_headers().items():
             resp.headers.setdefault(k, v)
         return None, resp

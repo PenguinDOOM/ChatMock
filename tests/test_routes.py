@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import requests
 import socket
 import sys
 import threading
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 import chatmock.cli as cli
 import chatmock.responses_api as responses_api
+import chatmock.upstream as upstream_module
 from chatmock import responses_websocket_bridge
 from chatmock.app import create_app
 from chatmock.responses_api import normalize_responses_payload
@@ -46,6 +48,7 @@ class FakeUpstream:
         self.headers = headers or {}
         self.content = content or b""
         self.text = text
+        self.close_calls = 0
 
     def iter_lines(self, decode_unicode: bool = False):
         for event in self._events or []:
@@ -64,6 +67,7 @@ class FakeUpstream:
         return json.loads(self.content.decode("utf-8"))
 
     def close(self) -> None:
+        self.close_calls += 1
         return None
 
 
@@ -588,12 +592,13 @@ class RouteTests(unittest.TestCase):
                 "code": "unknown_tool",
             }
         }
+        upstream = FakeUpstream(
+            status_code=400,
+            content=json.dumps(upstream_error).encode("utf-8"),
+            text=json.dumps(upstream_error),
+        )
         mock_start.return_value = (
-            FakeUpstream(
-                status_code=400,
-                content=json.dumps(upstream_error).encode("utf-8"),
-                text=json.dumps(upstream_error),
-            ),
+            upstream,
             None,
         )
 
@@ -604,6 +609,7 @@ class RouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json(), upstream_error)
+        self.assertEqual(upstream.close_calls, 1)
 
     @patch("chatmock.routes_openai.start_upstream_request")
     def test_chat_completions_non_json_upstream_errors_include_safe_context_contract(self, mock_start) -> None:
@@ -620,13 +626,14 @@ class RouteTests(unittest.TestCase):
 
         for status_code in (502, 503):
             with self.subTest(status_code=status_code):
+                upstream = FakeUpstream(
+                    status_code=status_code,
+                    headers={"Content-Type": "text/plain; charset=utf-8"},
+                    content=long_body.encode("utf-8"),
+                    text=long_body,
+                )
                 mock_start.return_value = (
-                    FakeUpstream(
-                        status_code=status_code,
-                        headers={"Content-Type": "text/plain; charset=utf-8"},
-                        content=long_body.encode("utf-8"),
-                        text=long_body,
-                    ),
+                    upstream,
                     None,
                 )
 
@@ -639,6 +646,7 @@ class RouteTests(unittest.TestCase):
                 message = body["error"]["message"]
 
                 self.assertEqual(response.status_code, status_code)
+                self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
                 self.assertIn(str(status_code), message)
                 self.assertIn("text/plain", message)
                 self.assertIn("gateway meltdown before JSON", message)
@@ -653,6 +661,7 @@ class RouteTests(unittest.TestCase):
                 ):
                     self.assertNotIn(secret, message)
                 self.assertLess(len(message), 500)
+                self.assertEqual(upstream.close_calls, 1)
 
     @patch("chatmock.routes_openai.start_upstream_request")
     def test_chat_completions_preserve_unknown_model_id(self, mock_start) -> None:
@@ -1676,9 +1685,65 @@ class RouteTests(unittest.TestCase):
         body = response.get_json()
         message = body["error"]["message"]
         self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
         self.assertIn("not-json", message)
         self.assertIn("event-stream", message)
         self.assertNotEqual(message, "Upstream response stream did not contain a completed response object")
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_responses_route_missing_completed_response_reports_upstream_context_contract(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.created", "response": {"id": "resp_incomplete"}},
+                ],
+                headers={"Content-Type": "text/event-stream"},
+            ),
+            None,
+        )
+
+        response = self.client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.4", "input": "hello"},
+        )
+
+        body = response.get_json()
+        message = body["error"]["message"]
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
+        self.assertIn("response.completed", message)
+        self.assertIn("response.created", message)
+        self.assertIn("event-stream", message)
+
+    @patch("chatmock.upstream.get_effective_chatgpt_auth", return_value=("access-token", "account-id"))
+    @patch(
+        "chatmock.upstream.requests.post",
+        side_effect=requests.RequestException(
+            "dial tcp refused Authorization: Bearer startup-secret-token"
+        ),
+    )
+    def test_start_upstream_raw_request_formats_request_exceptions(self, _mock_post, _mock_auth) -> None:
+        with self.app.test_request_context(
+            "/v1/responses",
+            headers={"Origin": "https://example.test"},
+        ):
+            upstream, error_resp = upstream_module.start_upstream_raw_request(
+                {"model": "gpt-5.4", "input": "hello"},
+                session_id="session-fixed",
+            )
+
+        self.assertIsNone(upstream)
+        self.assertIsNotNone(error_resp)
+        self.assertEqual(error_resp.status_code, 502)
+        self.assertEqual(
+            error_resp.headers["Access-Control-Allow-Origin"],
+            "https://example.test",
+        )
+        body = error_resp.get_json()
+        message = body["error"]["message"]
+        self.assertIn("Upstream ChatGPT request failed", message)
+        self.assertIn("RequestException", message)
+        self.assertNotIn("startup-secret-token", message)
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_stream_passthrough(self, mock_start) -> None:
