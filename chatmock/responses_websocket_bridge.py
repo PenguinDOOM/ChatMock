@@ -25,6 +25,7 @@ from .session import (
 from .upstream_errors import build_upstream_error
 from .upstream import build_upstream_headers, build_upstream_websocket_url, connect_upstream_websocket
 from .utils import get_effective_chatgpt_auth
+from .verbose_logging import log_verbose_json
 
 
 class ResponsesWebsocketBridgeProtocolError(ValueError):
@@ -36,16 +37,6 @@ def _close_request_upstream_websocket(upstream_ws) -> None:
         upstream_ws.close()
     except Exception:
         pass
-
-
-def _log_json(prefix: str, payload: Any) -> None:
-    try:
-        print(f"{prefix}\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
-    except Exception:
-        try:
-            print(f"{prefix}\n{payload}")
-        except Exception:
-            pass
 
 
 def _with_cors(response: Response) -> Response:
@@ -224,7 +215,7 @@ def _build_upstream_request_event(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _send_upstream_request(upstream_ws, payload: Dict[str, Any], *, verbose: bool) -> None:
     request_event = _build_upstream_request_event(payload)
     if verbose:
-        _log_json("OUTBOUND >> ChatGPT Responses WS payload", request_event)
+        log_verbose_json("OUTBOUND >> ChatGPT Responses WS payload", request_event, enabled=verbose)
     upstream_ws.send(json.dumps(request_event))
 
 
@@ -295,7 +286,11 @@ def _iter_streaming_events(
                     "error": {"message": str(exc)},
                 }
                 if verbose:
-                    _log_json("STREAM OUT /v1/responses (bridge error)", error_event)
+                    log_verbose_json(
+                        "STREAM OUT /v1/responses (bridge error)",
+                        error_event,
+                        enabled=verbose,
+                    )
                 _release_upstream_websocket(
                     upstream_ws,
                     retained_lease=retained_lease,
@@ -317,7 +312,11 @@ def _iter_streaming_events(
                 )
 
             if verbose:
-                _log_json("STREAM OUT /v1/responses (bridge event)", event)
+                log_verbose_json(
+                    "STREAM OUT /v1/responses (bridge event)",
+                    event,
+                    enabled=verbose,
+                )
             note_responses_stream_event(session_id, event)
             response = event.get("response")
             if isinstance(response, dict) and isinstance(response.get("id"), str):
@@ -374,7 +373,11 @@ def _collect_response(
                 )
 
             if verbose:
-                _log_json("STREAM OUT /v1/responses (bridge event)", event)
+                log_verbose_json(
+                    "STREAM OUT /v1/responses (bridge event)",
+                    event,
+                    enabled=verbose,
+                )
 
             if event_type != "response.completed":
                 note_responses_stream_event(session_id, event)

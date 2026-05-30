@@ -148,6 +148,43 @@ class VerboseLoggerHandlerHelperTests(unittest.TestCase):
             )
 
 
+class VerboseLoggingModuleTests(unittest.TestCase):
+    def test_configure_verbose_logger_is_idempotent(self) -> None:
+        from chatmock import verbose_logging
+
+        logger = logging.getLogger("chatmock.verbose")
+        previous_handlers = list(logger.handlers)
+        previous_level = logger.level
+        previous_propagate = logger.propagate
+        previous_disabled = logger.disabled
+
+        for handler in previous_handlers:
+            logger.removeHandler(handler)
+
+        try:
+            configured_logger = verbose_logging.configure_verbose_logger()
+            configured_again = verbose_logging.configure_verbose_logger()
+
+            named_handlers = [
+                handler
+                for handler in logger.handlers
+                if handler.get_name() == verbose_logging.VERBOSE_STDOUT_HANDLER_NAME
+            ]
+
+            self.assertIs(configured_logger, logger)
+            self.assertIs(configured_again, logger)
+            self.assertEqual(len(named_handlers), 1)
+            self.assertFalse(logger.propagate)
+        finally:
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+            for handler in previous_handlers:
+                logger.addHandler(handler)
+            logger.setLevel(previous_level)
+            logger.propagate = previous_propagate
+            logger.disabled = previous_disabled
+
+
 def make_json_response(body: dict[str, object], *, status_code: int = 200) -> Response:
     return Response(json.dumps(body), status=status_code, mimetype="application/json")
 

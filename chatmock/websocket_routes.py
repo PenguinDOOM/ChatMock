@@ -20,16 +20,7 @@ from .session import (
 from .upstream_errors import build_upstream_error
 from .upstream import build_upstream_headers, build_upstream_websocket_url, connect_upstream_websocket
 from .utils import get_effective_chatgpt_auth
-
-
-def _log_json(prefix: str, payload: Any) -> None:
-    try:
-        print(f"{prefix}\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
-    except Exception:
-        try:
-            print(f"{prefix}\n{payload}")
-        except Exception:
-            pass
+from .verbose_logging import log_verbose_json, log_verbose_message
 
 
 def _error_event(message: str, *, status_code: int = 400, code: str | None = None) -> Dict[str, Any]:
@@ -89,7 +80,7 @@ def register_websocket_routes(sock: Sock) -> None:
         def _send_error(message: str, *, status_code: int = 400, code: str | None = None) -> None:
             evt = _error_event(message, status_code=status_code, code=code)
             if verbose:
-                _log_json("STREAM OUT WS /v1/responses (error)", evt)
+                log_verbose_json("STREAM OUT WS /v1/responses (error)", evt, enabled=verbose)
             try:
                 ws.send(json.dumps(evt))
             except Exception:
@@ -106,7 +97,7 @@ def register_websocket_routes(sock: Sock) -> None:
                 else:
                     incoming_text = str(incoming)
                 if verbose:
-                    print("IN WS /v1/responses\n" + incoming_text)
+                    log_verbose_message("IN WS /v1/responses\n" + incoming_text, enabled=verbose)
 
                 try:
                     payload = json.loads(incoming_text)
@@ -134,7 +125,10 @@ def register_websocket_routes(sock: Sock) -> None:
                         continue
 
                     if normalized.service_tier_resolution.warning_message and verbose:
-                        print(f"[FastMode] {normalized.service_tier_resolution.warning_message}")
+                        log_verbose_message(
+                            f"[FastMode] {normalized.service_tier_resolution.warning_message}",
+                            enabled=verbose,
+                        )
                     prepared = prepare_responses_request_for_session(
                         normalized.session_id,
                         normalized.payload,
@@ -144,7 +138,11 @@ def register_websocket_routes(sock: Sock) -> None:
                     session_id = normalized.session_id
                     active_session_id = normalized.session_id
                     if verbose:
-                        _log_json("OUTBOUND >> ChatGPT Responses WS payload", prepared.payload)
+                        log_verbose_json(
+                            "OUTBOUND >> ChatGPT Responses WS payload",
+                            prepared.payload,
+                            enabled=verbose,
+                        )
                 elif upstream_ws is None:
                     _send_error(
                         "The first websocket message must be a response.create request.",
@@ -224,10 +222,10 @@ def register_websocket_routes(sock: Sock) -> None:
                         )
                         return
                     if verbose:
-                        try:
-                            print("STREAM OUT WS /v1/responses\n" + str(upstream_message))
-                        except Exception:
-                            pass
+                        log_verbose_message(
+                            "STREAM OUT WS /v1/responses\n" + str(upstream_message),
+                            enabled=verbose,
+                        )
                     ws.send(upstream_message)
 
                     try:

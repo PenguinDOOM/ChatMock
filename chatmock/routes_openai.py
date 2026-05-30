@@ -42,6 +42,7 @@ from .utils import (
     sse_translate_chat,
     sse_translate_text,
 )
+from .verbose_logging import log_verbose_json, log_verbose_message, wrap_verbose_stream
 
 
 openai_bp = Blueprint("openai", __name__)
@@ -612,23 +613,20 @@ def responses_create() -> Response:
     stateful_http_bridge_enabled = _stateful_http_responses_bridge_enabled()
     raw = request.get_data(cache=True, as_text=True) or ""
     if verbose:
-        try:
-            print("IN POST /v1/responses\n" + raw)
-        except Exception:
-            pass
+        log_verbose_message("IN POST /v1/responses\n" + raw, enabled=verbose)
 
     try:
         payload = json.loads(raw) if raw else {}
     except Exception:
         err = {"error": {"message": "Invalid JSON body"}}
         if verbose:
-            _log_json("OUT POST /v1/responses", err)
+            log_verbose_json("OUT POST /v1/responses", err, enabled=verbose)
         return jsonify(err), 400
 
     if not isinstance(payload, dict):
         err = {"error": {"message": "Request body must be a JSON object"}}
         if verbose:
-            _log_json("OUT POST /v1/responses", err)
+            log_verbose_json("OUT POST /v1/responses", err, enabled=verbose)
         return jsonify(err), 400
 
     client_session_id = extract_client_session_id(request.headers)
@@ -644,11 +642,14 @@ def responses_create() -> Response:
         if exc.code:
             err["error"]["code"] = exc.code
         if verbose:
-            _log_json("OUT POST /v1/responses", err)
+            log_verbose_json("OUT POST /v1/responses", err, enabled=verbose)
         return jsonify(err), exc.status_code
 
     if normalized.service_tier_resolution.warning_message and verbose:
-        print(f"[FastMode] {normalized.service_tier_resolution.warning_message}")
+        log_verbose_message(
+            f"[FastMode] {normalized.service_tier_resolution.warning_message}",
+            enabled=verbose,
+        )
 
     previous_response_id = normalized.payload.get("previous_response_id")
     explicit_previous_response_id = (
@@ -702,7 +703,7 @@ def responses_create() -> Response:
                         parsed = json.loads(body)
                     except Exception:
                         parsed = body
-                    _log_json("OUT POST /v1/responses", parsed)
+                    log_verbose_json("OUT POST /v1/responses", parsed, enabled=verbose)
             except Exception:
                 pass
         return error_resp
@@ -727,19 +728,19 @@ def responses_create() -> Response:
             )
         clear_responses_reuse_state(normalized.session_id)
         if verbose:
-            _log_json("OUT POST /v1/responses", err_body)
+            log_verbose_json("OUT POST /v1/responses", err_body, enabled=verbose)
         return _json_response_with_cors(err_body, upstream.status_code)
 
     if stream_req:
         if verbose:
-            print("OUT POST /v1/responses (streaming response)")
-        stream_iter = _wrap_stream_logging(
+            log_verbose_message("OUT POST /v1/responses (streaming response)", enabled=verbose)
+        stream_iter = wrap_verbose_stream(
             "STREAM OUT /v1/responses",
             stream_upstream_bytes(
                 upstream,
                 on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt),
             ),
-            verbose,
+            enabled=verbose,
         )
         resp = Response(
             stream_iter,
@@ -761,7 +762,7 @@ def responses_create() -> Response:
         if isinstance(body, dict):
             note_responses_final_response(normalized.session_id, body)
             if verbose:
-                _log_json("OUT POST /v1/responses", body)
+                log_verbose_json("OUT POST /v1/responses", body, enabled=verbose)
             resp = make_response(jsonify(body), upstream.status_code)
             for k, v in build_cors_headers().items():
                 resp.headers.setdefault(k, v)
@@ -790,7 +791,7 @@ def responses_create() -> Response:
             )
         clear_responses_reuse_state(normalized.session_id)
         if verbose:
-            _log_json("OUT POST /v1/responses", formatted_error)
+            log_verbose_json("OUT POST /v1/responses", formatted_error, enabled=verbose)
         return _json_response_with_cors(formatted_error, 502)
 
     if response_obj is None or not inspected_upstream.completed_seen:
@@ -802,11 +803,11 @@ def responses_create() -> Response:
             body=inspected_upstream.invalid_event_data or inspected_upstream.last_event_data,
         )
         if verbose:
-            _log_json("OUT POST /v1/responses", err)
+            log_verbose_json("OUT POST /v1/responses", err, enabled=verbose)
         return _json_response_with_cors(err, 502)
 
     if verbose:
-        _log_json("OUT POST /v1/responses", response_obj)
+        log_verbose_json("OUT POST /v1/responses", response_obj, enabled=verbose)
     return _json_response_with_cors(response_obj, upstream.status_code)
 
 
