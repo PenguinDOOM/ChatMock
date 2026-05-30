@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import requests
 import socket
 import sys
@@ -86,6 +87,65 @@ class FakeUpstreamWebsocket:
     def close(self) -> None:
         self.close_calls += 1
         return None
+
+
+class CapturedVerboseLogHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def attach_verbose_logger_handler() -> tuple[logging.Logger, CapturedVerboseLogHandler, int, bool, bool]:
+    logger = logging.getLogger("chatmock.verbose")
+    existing_handler = next(
+        (current_handler for current_handler in logger.handlers if isinstance(current_handler, CapturedVerboseLogHandler)),
+        None,
+    )
+    if existing_handler is not None:
+        raise AssertionError("CapturedVerboseLogHandler already attached to chatmock.verbose")
+
+    handler = CapturedVerboseLogHandler()
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    previous_disabled = logger.disabled
+    logger.disabled = False
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+    return logger, handler, previous_level, previous_propagate, previous_disabled
+
+
+def detach_verbose_logger_handler(
+    logger: logging.Logger,
+    handler: CapturedVerboseLogHandler,
+    previous_level: int,
+    previous_propagate: bool,
+    previous_disabled: bool,
+) -> None:
+    logger.removeHandler(handler)
+    logger.setLevel(previous_level)
+    logger.propagate = previous_propagate
+    logger.disabled = previous_disabled
+
+
+class VerboseLoggerHandlerHelperTests(unittest.TestCase):
+    def test_attach_verbose_logger_handler_rejects_double_attachment(self) -> None:
+        logger, handler, previous_level, previous_propagate, previous_disabled = attach_verbose_logger_handler()
+
+        try:
+            with self.assertRaisesRegex(AssertionError, "already attached"):
+                attach_verbose_logger_handler()
+        finally:
+            detach_verbose_logger_handler(
+                logger,
+                handler,
+                previous_level,
+                previous_propagate,
+                previous_disabled,
+            )
 
 
 def make_json_response(body: dict[str, object], *, status_code: int = 200) -> Response:
@@ -2441,6 +2501,106 @@ class ResponsesWebsocketUpstreamStatefulContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         reset_retained_upstream_websocket_sessions()
 
+    def test_stateful_mode_verbose_request_logs_to_named_logger_and_passes_verbose_to_bridge(self) -> None:
+        app = create_app(
+            verbose=True,
+            responses_websocket_upstream=True,
+            responses_websocket_upstream_stateful=True,
+        )
+        client = app.test_client()
+        logger, handler, previous_level, previous_propagate, previous_disabled = attach_verbose_logger_handler()
+
+        try:
+            with (
+                patch(
+                    "chatmock.routes_openai.responses_websocket_bridge.send_responses_request_via_websocket"
+                ) as mock_bridge,
+                patch(
+                    "chatmock.routes_openai.start_upstream_raw_request",
+                    side_effect=AssertionError(
+                        "HTTP upstream transport should not be used when websocket upstream mode is enabled"
+                    ),
+                ),
+            ):
+                mock_bridge.return_value = make_json_response(
+                    {
+                        "id": "resp_stateful_verbose_1",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [],
+                    }
+                )
+
+                response = client.post(
+                    "/v1/responses",
+                    json={"model": "gpt-5.4", "input": "hello"},
+                )
+        finally:
+            detach_verbose_logger_handler(
+                logger,
+                handler,
+                previous_level,
+                previous_propagate,
+                previous_disabled,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_bridge.assert_called_once()
+        self.assertTrue(mock_bridge.call_args.kwargs["stateful"])
+        self.assertTrue(mock_bridge.call_args.kwargs["verbose"])
+        self.assertTrue(
+            any(message.startswith("IN POST /v1/responses") for message in handler.messages),
+            handler.messages,
+        )
+
+    def test_stateful_mode_verbose_disabled_keeps_named_logger_silent(self) -> None:
+        app = create_app(
+            verbose=False,
+            responses_websocket_upstream=True,
+            responses_websocket_upstream_stateful=True,
+        )
+        client = app.test_client()
+        logger, handler, previous_level, previous_propagate, previous_disabled = attach_verbose_logger_handler()
+
+        try:
+            with (
+                patch(
+                    "chatmock.routes_openai.responses_websocket_bridge.send_responses_request_via_websocket"
+                ) as mock_bridge,
+                patch(
+                    "chatmock.routes_openai.start_upstream_raw_request",
+                    side_effect=AssertionError(
+                        "HTTP upstream transport should not be used when websocket upstream mode is enabled"
+                    ),
+                ),
+            ):
+                mock_bridge.return_value = make_json_response(
+                    {
+                        "id": "resp_stateful_quiet_1",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [],
+                    }
+                )
+
+                response = client.post(
+                    "/v1/responses",
+                    json={"model": "gpt-5.4", "input": "hello"},
+                )
+        finally:
+            detach_verbose_logger_handler(
+                logger,
+                handler,
+                previous_level,
+                previous_propagate,
+                previous_disabled,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_bridge.assert_called_once()
+        self.assertFalse(mock_bridge.call_args.kwargs["verbose"])
+        self.assertEqual(handler.messages, [])
+
     def test_stateful_mode_accepts_first_request_without_explicit_session_headers(self) -> None:
         fake_upstream = FakeUpstreamWebsocket(
             [
@@ -3376,6 +3536,46 @@ class ResponsesWebsocketBridgeTests(unittest.TestCase):
         self.assertEqual(fake_upstream.close_calls, 1)
         self.assertIn('data: {"type":"response.completed","response":{"id":"resp_ws_1","output":[]}}', body)
         self.assertNotIn("data: [DONE]", body)
+
+    @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
+    def test_stateful_bridge_verbose_logs_outbound_payload_to_named_logger(self, mock_connect, _mock_auth) -> None:
+        fake_upstream = FakeUpstreamWebsocket(
+            [
+                json.dumps({"type": "response.created", "response": {"id": "resp_ws_verbose_1"}}),
+                json.dumps({"type": "response.completed", "response": {"id": "resp_ws_verbose_1", "output": []}}),
+            ]
+        )
+        mock_connect.return_value = fake_upstream
+        logger, handler, previous_level, previous_propagate, previous_disabled = attach_verbose_logger_handler()
+
+        try:
+            with self.app.test_request_context("/v1/responses", method="POST"):
+                response = responses_websocket_bridge.send_responses_request_via_websocket(
+                    payload={"type": "response.create", "model": "gpt-5.4", "stream": True},
+                    session_id="session-stateful-verbose-logger",
+                    stream=False,
+                    verbose=True,
+                    stateful=True,
+                )
+        finally:
+            detach_verbose_logger_handler(
+                logger,
+                handler,
+                previous_level,
+                previous_propagate,
+                previous_disabled,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(fake_upstream.sent[0])["type"], "response.create")
+        self.assertTrue(
+            any(
+                message.startswith("OUTBOUND >> ChatGPT Responses WS payload")
+                for message in handler.messages
+            ),
+            handler.messages,
+        )
 
     @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
     @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
