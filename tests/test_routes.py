@@ -1866,6 +1866,44 @@ class RouteTests(unittest.TestCase):
 
     @patch("chatmock.websocket_routes.get_effective_chatgpt_auth", return_value=("token", "acct"))
     @patch("chatmock.websocket_routes.connect_upstream_websocket")
+    def test_responses_websocket_connect_failure_reports_phase_context_contract(self, mock_connect, _mock_auth) -> None:
+        mock_connect.side_effect = RuntimeError(
+            "dial tcp refused Authorization: Bearer route-secret-token"
+        )
+
+        app = create_app()
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+        sock.close()
+
+        server_thread = threading.Thread(
+            target=app.run,
+            kwargs={
+                "host": host,
+                "port": port,
+                "use_reloader": False,
+                "threaded": True,
+            },
+            daemon=True,
+        )
+        server_thread.start()
+        time.sleep(0.5)
+
+        with ws_connect(f"ws://{host}:{port}/v1/responses") as client:
+            client.send(json.dumps({"type": "response.create", "model": "gpt-5.4", "input": "hello"}))
+            error_event = json.loads(client.recv())
+
+        self.assertEqual(error_event["type"], "error")
+        self.assertEqual(error_event["status_code"], 502)
+        self.assertIn("Upstream websocket connection failed", error_event["error"]["message"])
+        self.assertIn("phase=connect", error_event["error"]["message"])
+        self.assertIn("RuntimeError", error_event["error"]["message"])
+        self.assertNotIn("route-secret-token", error_event["error"]["message"])
+
+    @patch("chatmock.websocket_routes.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.websocket_routes.connect_upstream_websocket")
     def test_responses_websocket_unexpected_close_reports_close_context_contract(self, mock_connect, _mock_auth) -> None:
         class FakeUpstreamWebsocket:
             def send(self, message: str) -> None:
@@ -1905,6 +1943,7 @@ class RouteTests(unittest.TestCase):
 
         self.assertEqual(error_event["type"], "error")
         self.assertEqual(error_event["status_code"], 502)
+        self.assertIn("phase=receive", error_event["error"]["message"])
         self.assertIn("1011", error_event["error"]["message"])
         self.assertIn("gateway reset", error_event["error"]["message"])
         self.assertNotEqual(error_event["error"]["message"], "Upstream websocket closed unexpectedly.")
@@ -3101,6 +3140,41 @@ class ResponsesWebsocketBridgeTests(unittest.TestCase):
         ):
             responses_websocket_bridge.parse_upstream_websocket_event('{"type":"response.completed"}')
 
+    def test_collect_response_with_response_marker_keeps_protocol_error_on_formatter_502_path(self) -> None:
+        class FakeUpstreamWebsocket:
+            def __init__(self) -> None:
+                self._messages = [
+                    json.dumps({"type": "response.created", "response": {"id": "resp_ws_protocol_1"}}),
+                    json.dumps({"type": "response.completed"}),
+                ]
+                self.close_calls = 0
+
+            def recv(self) -> str:
+                return self._messages.pop(0)
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        fake_upstream = FakeUpstreamWebsocket()
+
+        response_obj, error_obj, status_code = responses_websocket_bridge._collect_response(
+            fake_upstream,
+            session_id="session-fixed",
+            verbose=False,
+            response_marker="resp_ws_protocol_1",
+        )
+
+        self.assertIsNone(response_obj)
+        self.assertEqual(status_code, 502)
+        self.assertIsNotNone(error_obj)
+        self.assertIn(
+            "Upstream websocket response.completed event is missing a response object",
+            error_obj["error"]["message"],
+        )
+        self.assertIn("phase=protocol", error_obj["error"]["message"])
+        self.assertNotIn("previous_response_not_found", json.dumps(error_obj))
+        self.assertEqual(fake_upstream.close_calls, 1)
+
     def test_build_upstream_request_event_keeps_existing_response_create_payload(self) -> None:
         payload = {"type": "response.create", "model": "gpt-5.4", "input": "hello", "stream": True}
 
@@ -3502,6 +3576,139 @@ class ResponsesWebsocketBridgeTests(unittest.TestCase):
 
     @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
     @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
+    def test_bridge_formats_connection_failure_contract(self, mock_connect, _mock_auth) -> None:
+        mock_connect.side_effect = RuntimeError(
+            "dial tcp refused Authorization: Bearer bridge-secret-token"
+        )
+
+        with self.app.test_request_context("/v1/responses", method="POST"):
+            response = responses_websocket_bridge.send_responses_request_via_websocket(
+                payload={"type": "response.create", "model": "gpt-5.4", "stream": True},
+                session_id="session-fixed",
+                stream=False,
+            )
+
+        body = response.get_json()
+        message = body["error"]["message"]
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("Upstream websocket connection failed", message)
+        self.assertIn("phase=connect", message)
+        self.assertIn("RuntimeError", message)
+        self.assertNotIn("bridge-secret-token", message)
+
+    @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
+    def test_bridge_preserves_structured_upstream_response_failed_error_payload(self, mock_connect, _mock_auth) -> None:
+        mock_connect.return_value = FakeUpstreamWebsocket(
+            [
+                json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": "resp_ws_1",
+                            "error": {
+                                "message": "Detailed upstream failure",
+                                "type": "server_error",
+                                "code": "upstream_failed",
+                            },
+                        },
+                    }
+                )
+            ]
+        )
+
+        with self.app.test_request_context("/v1/responses", method="POST"):
+            response = responses_websocket_bridge.send_responses_request_via_websocket(
+                payload={"type": "response.create", "model": "gpt-5.4", "stream": True},
+                session_id="session-fixed",
+                stream=False,
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "error": {
+                    "message": "Detailed upstream failure",
+                    "type": "server_error",
+                    "code": "upstream_failed",
+                }
+            },
+        )
+
+    @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
+    def test_bridge_formats_send_failure_contract(self, mock_connect, _mock_auth) -> None:
+        class FakeFailingUpstreamWebsocket:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def send(self, message: str) -> None:
+                raise RuntimeError(
+                    "send failed Authorization: Bearer bridge-send-secret"
+                )
+
+            def close(self) -> None:
+                self.close_calls += 1
+                return None
+
+        fake_upstream = FakeFailingUpstreamWebsocket()
+        mock_connect.return_value = fake_upstream
+
+        with self.app.test_request_context("/v1/responses", method="POST"):
+            response = responses_websocket_bridge.send_responses_request_via_websocket(
+                payload={"type": "response.create", "model": "gpt-5.4", "stream": True},
+                session_id="session-fixed",
+                stream=False,
+            )
+
+        body = response.get_json()
+        message = body["error"]["message"]
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("Upstream websocket request send failed", message)
+        self.assertIn("phase=send", message)
+        self.assertIn("RuntimeError", message)
+        self.assertNotIn("bridge-send-secret", message)
+        self.assertEqual(fake_upstream.close_calls, 1)
+
+    @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
+    def test_bridge_formats_receive_close_contract(self, mock_connect, _mock_auth) -> None:
+        class FakeClosingUpstreamWebsocket:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def send(self, message: str) -> None:
+                return None
+
+            def recv(self) -> str:
+                raise ConnectionClosed(Close(1011, "gateway reset"), None)
+
+            def close(self) -> None:
+                self.close_calls += 1
+                return None
+
+        fake_upstream = FakeClosingUpstreamWebsocket()
+        mock_connect.return_value = fake_upstream
+
+        with self.app.test_request_context("/v1/responses", method="POST"):
+            response = responses_websocket_bridge.send_responses_request_via_websocket(
+                payload={"type": "response.create", "model": "gpt-5.4", "stream": True},
+                session_id="session-fixed",
+                stream=False,
+            )
+
+        body = response.get_json()
+        message = body["error"]["message"]
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("Upstream websocket closed before response.completed", message)
+        self.assertIn("phase=receive", message)
+        self.assertIn("1011", message)
+        self.assertIn("gateway reset", message)
+        self.assertEqual(fake_upstream.close_calls, 1)
+
+    @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
     def test_bridge_stops_after_protocol_error_event_without_done_sentinel(self, mock_connect, _mock_auth) -> None:
         class FakeUpstreamWebsocket:
             def __init__(self) -> None:
@@ -3532,8 +3739,33 @@ class ResponsesWebsocketBridgeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.content_type.startswith("text/event-stream"))
         self.assertIn('data: {"type":"response.created","response":{"id":"resp_ws_1"}}', body)
-        self.assertIn('data: {"type":"error","status_code":502,"error":{"message":"Upstream websocket response.completed event is missing a response object"}}', body)
+        self.assertIn("Upstream websocket response.completed event is missing a response object", body)
+        self.assertIn("phase=protocol", body)
         self.assertNotIn("data: [DONE]", body)
+
+    @patch("chatmock.responses_websocket_bridge._collect_response", return_value=(None, None, 200))
+    @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
+    def test_bridge_formats_missing_completed_response_fallback_contract(
+        self,
+        mock_connect,
+        _mock_auth,
+        _mock_collect_response,
+    ) -> None:
+        mock_connect.return_value = FakeUpstreamWebsocket([])
+
+        with self.app.test_request_context("/v1/responses", method="POST"):
+            response = responses_websocket_bridge.send_responses_request_via_websocket(
+                payload={"type": "response.create", "model": "gpt-5.4", "stream": True},
+                session_id="session-fixed",
+                stream=False,
+            )
+
+        body = response.get_json()
+        message = body["error"]["message"]
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("response.completed", message)
+        self.assertIn("phase=response.completed", message)
 
     @patch("chatmock.responses_websocket_bridge.get_effective_chatgpt_auth", return_value=("token", "acct"))
     @patch("chatmock.responses_websocket_bridge.connect_upstream_websocket")
@@ -3728,8 +3960,12 @@ class ResponsesWebsocketBridgeTests(unittest.TestCase):
             )
 
         self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 400)
-        self.assertEqual(second.get_json()["error"]["code"], "previous_response_not_found")
+        self.assertEqual(second.status_code, 502)
+        self.assertIn(
+            "Upstream websocket response.completed event is missing a response object",
+            second.get_json()["error"]["message"],
+        )
+        self.assertIn("phase=protocol", second.get_json()["error"]["message"])
         self.assertEqual(third.status_code, 400)
         self.assertEqual(third.get_json()["error"]["code"], "previous_response_not_found")
         self.assertEqual(mock_connect.call_count, 1)

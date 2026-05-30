@@ -22,6 +22,7 @@ from .session import (
     note_responses_final_response,
     note_responses_stream_event,
 )
+from .upstream_errors import build_upstream_error
 from .upstream import build_upstream_headers, build_upstream_websocket_url, connect_upstream_websocket
 from .utils import get_effective_chatgpt_auth
 
@@ -55,6 +56,57 @@ def _with_cors(response: Response) -> Response:
 
 def _json_response(body: Dict[str, Any], *, status_code: int) -> Response:
     return _with_cors(make_response(jsonify(body), status_code))
+
+
+def _formatted_error_message(
+    message: str,
+    *,
+    phase: str,
+    exception: Any = None,
+    body: Any = None,
+) -> str:
+    return build_upstream_error(
+        message,
+        phase=phase,
+        exception=exception,
+        body=body,
+    )["error"]["message"]
+
+
+def _is_schema_compatible_error(error: Any) -> bool:
+    return (
+        isinstance(error, dict)
+        and isinstance(error.get("message"), str)
+        and bool(error.get("message").strip())
+    )
+
+
+def _error_body_from_payload(
+    error: Any,
+    *,
+    message: str,
+    phase: str,
+) -> Dict[str, Any]:
+    if _is_schema_compatible_error(error):
+        return {"error": error}
+    return build_upstream_error(message, phase=phase, body=error)
+
+
+def _connection_closed_detail(exc: ConnectionClosed) -> str | None:
+    close_frame = getattr(exc, "rcvd", None) or getattr(exc, "sent", None)
+    if close_frame is None:
+        return None
+
+    details: list[str] = []
+    code = getattr(close_frame, "code", None)
+    reason = getattr(close_frame, "reason", None)
+    if code is not None:
+        details.append(f"close_code={code}")
+    if isinstance(reason, str) and reason:
+        details.append(f"close_reason={reason}")
+    if not details:
+        return None
+    return "; ".join(details)
 
 
 def _previous_response_not_found_error(response_marker: str | None) -> Dict[str, Any]:
@@ -99,23 +151,36 @@ def parse_upstream_websocket_event(message: Any) -> Dict[str, Any]:
         payload = json.loads(raw_text)
     except Exception as exc:
         raise ResponsesWebsocketBridgeProtocolError(
-            "Upstream websocket event payload was not a JSON object"
+            _formatted_error_message(
+                "Upstream websocket event payload was not a JSON object",
+                phase="protocol",
+                exception=exc,
+            )
         ) from exc
 
     if not isinstance(payload, dict):
         raise ResponsesWebsocketBridgeProtocolError(
-            "Upstream websocket event payload was not a JSON object"
+            _formatted_error_message(
+                "Upstream websocket event payload was not a JSON object",
+                phase="protocol",
+            )
         )
 
     event_type = payload.get("type")
     if not isinstance(event_type, str) or not event_type.strip():
         raise ResponsesWebsocketBridgeProtocolError(
-            "Upstream websocket event payload is missing a string type"
+            _formatted_error_message(
+                "Upstream websocket event payload is missing a string type",
+                phase="protocol",
+            )
         )
 
     if event_type in ("response.completed", "response.failed") and not isinstance(payload.get("response"), dict):
         raise ResponsesWebsocketBridgeProtocolError(
-            f"Upstream websocket {event_type} event is missing a response object"
+            _formatted_error_message(
+                f"Upstream websocket {event_type} event is missing a response object",
+                phase="protocol",
+            )
         )
 
     return payload
@@ -126,12 +191,20 @@ def _recv_upstream_event(upstream_ws) -> Dict[str, Any]:
         message = upstream_ws.recv()
     except ConnectionClosed as exc:
         raise ResponsesWebsocketBridgeProtocolError(
-            "Upstream websocket closed before response.completed"
+            _formatted_error_message(
+                "Upstream websocket closed before response.completed",
+                phase="receive",
+                exception=exc,
+                body=_connection_closed_detail(exc),
+            )
         ) from exc
 
     if message is None:
         raise ResponsesWebsocketBridgeProtocolError(
-            "Upstream websocket closed before response.completed"
+            _formatted_error_message(
+                "Upstream websocket closed before response.completed",
+                phase="receive",
+            )
         )
 
     return parse_upstream_websocket_event(message)
@@ -315,25 +388,31 @@ def _collect_response(
             if event_type == "response.failed":
                 clear_responses_reuse_state(session_id)
                 retain_upstream = False
-                error = response.get("error") if isinstance(response.get("error"), dict) else {"message": "response.failed"}
+                error = response.get("error") if isinstance(response.get("error"), dict) else None
                 if response_marker and _has_previous_response_not_found_code(error):
                     return None, _previous_response_not_found_error(response_marker), 400
-                return None, {"error": error}, 502
+                return None, _error_body_from_payload(
+                    error,
+                    message="Upstream websocket response.failed event did not provide a valid error",
+                    phase="response.failed",
+                ), 502
             if event_type == "error":
                 clear_responses_reuse_state(session_id)
                 retain_upstream = False
-                error = event.get("error") if isinstance(event.get("error"), dict) else {"message": "Upstream websocket error"}
+                error = event.get("error") if isinstance(event.get("error"), dict) else None
                 if response_marker and _has_previous_response_not_found_code(error):
                     return None, _previous_response_not_found_error(response_marker), 400
                 status_code = event.get("status_code") if isinstance(event.get("status_code"), int) else 502
-                return None, {"error": error}, status_code
+                return None, _error_body_from_payload(
+                    error,
+                    message="Upstream websocket error",
+                    phase="response.error",
+                ), status_code
             if event_type == "response.completed":
                 return response_obj, None, 200
     except ResponsesWebsocketBridgeProtocolError as exc:
         clear_responses_reuse_state(session_id)
         retain_upstream = False
-        if response_marker:
-            return None, _previous_response_not_found_error(response_marker), 400
         return None, {"error": {"message": str(exc)}}, 502
     finally:
         _release_upstream_websocket(
@@ -419,7 +498,11 @@ def send_responses_request_via_websocket(
                 status_code=401,
             )
         return _json_response(
-            {"error": {"message": f"Upstream websocket connection failed: {exc}"}},
+            build_upstream_error(
+                "Upstream websocket connection failed",
+                phase="connect",
+                exception=exc,
+            ),
             status_code=502,
         )
 
@@ -438,7 +521,11 @@ def send_responses_request_via_websocket(
                 status_code=400,
             )
         return _json_response(
-            {"error": {"message": f"Upstream websocket request send failed: {exc}"}},
+            build_upstream_error(
+                "Upstream websocket request send failed",
+                phase="send",
+                exception=exc,
+            ),
             status_code=502,
         )
 
@@ -463,7 +550,10 @@ def send_responses_request_via_websocket(
     if response_obj is None:
         clear_responses_reuse_state(session_id)
         return _json_response(
-            {"error": {"message": "Upstream websocket closed before response.completed"}},
+            build_upstream_error(
+                "Upstream websocket closed before response.completed",
+                phase="response.completed",
+            ),
             status_code=502,
         )
     note_responses_final_response(session_id, response_obj)

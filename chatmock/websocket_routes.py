@@ -17,6 +17,7 @@ from .session import (
     note_responses_stream_event,
     prepare_responses_request_for_session,
 )
+from .upstream_errors import build_upstream_error
 from .upstream import build_upstream_headers, build_upstream_websocket_url, connect_upstream_websocket
 from .utils import get_effective_chatgpt_auth
 
@@ -43,6 +44,38 @@ def _is_terminal_event(event: Any) -> bool:
         return False
     kind = event.get("type")
     return kind in ("response.completed", "response.failed", "error")
+
+
+def _formatted_error_message(
+    message: str,
+    *,
+    phase: str,
+    exception: Any = None,
+    body: Any = None,
+) -> str:
+    return build_upstream_error(
+        message,
+        phase=phase,
+        exception=exception,
+        body=body,
+    )["error"]["message"]
+
+
+def _connection_closed_detail(exc: ConnectionClosed) -> str | None:
+    close_frame = getattr(exc, "rcvd", None) or getattr(exc, "sent", None)
+    if close_frame is None:
+        return None
+
+    details: list[str] = []
+    code = getattr(close_frame, "code", None)
+    reason = getattr(close_frame, "reason", None)
+    if code is not None:
+        details.append(f"close_code={code}")
+    if isinstance(reason, str) and reason:
+        details.append(f"close_reason={reason}")
+    if not details:
+        return None
+    return "; ".join(details)
 
 
 def register_websocket_routes(sock: Sock) -> None:
@@ -151,7 +184,11 @@ def register_websocket_routes(sock: Sock) -> None:
                         if session_id:
                             clear_responses_reuse_state(session_id)
                         _send_error(
-                            f"Upstream websocket connection failed: {exc}",
+                            _formatted_error_message(
+                                "Upstream websocket connection failed",
+                                phase="connect",
+                                exception=exc,
+                            ),
                             status_code=502,
                         )
                         break
@@ -162,15 +199,29 @@ def register_websocket_routes(sock: Sock) -> None:
                 while True:
                     try:
                         upstream_message = upstream_ws.recv()
-                    except ConnectionClosed:
+                    except ConnectionClosed as exc:
                         if active_session_id:
                             clear_responses_reuse_state(active_session_id)
-                        _send_error("Upstream websocket closed unexpectedly.", status_code=502)
+                        _send_error(
+                            _formatted_error_message(
+                                "Upstream websocket closed unexpectedly",
+                                phase="receive",
+                                exception=exc,
+                                body=_connection_closed_detail(exc),
+                            ),
+                            status_code=502,
+                        )
                         return
                     if upstream_message is None:
                         if active_session_id:
                             clear_responses_reuse_state(active_session_id)
-                        _send_error("Upstream websocket closed unexpectedly.", status_code=502)
+                        _send_error(
+                            _formatted_error_message(
+                                "Upstream websocket closed unexpectedly",
+                                phase="receive",
+                            ),
+                            status_code=502,
+                        )
                         return
                     if verbose:
                         try:
