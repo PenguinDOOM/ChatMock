@@ -35,13 +35,49 @@ class NormalizedResponsesRequest:
     service_tier_resolution: ServiceTierResolution
 
 
-def instructions_for_model(config: Dict[str, Any], model: str) -> str:
+def should_inject_base_instructions(
+    config: Dict[str, Any],
+    *,
+    route_name: str,
+    payload: Dict[str, Any],
+) -> bool:
+    if route_name == "/v1/responses" and "instructions" in payload:
+        return False
+    mode = str(config.get("BASE_INSTRUCTIONS_MODE") or "fallback").strip().lower()
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    if route_name == "/v1/responses":
+        return "instructions" not in payload
+    if route_name == "/v1/completions":
+        # Legacy completions has no route-level instructions override, so
+        # fallback should still inject the built-in instructions.
+        return True
+    if route_name in {"/v1/chat/completions", "/api/chat"}:
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return True
+        return not any(
+            isinstance(message, dict)
+            and str(message.get("role") or "").strip().lower() == "system"
+            for message in messages
+        )
+    return False
+
+
+def resolve_builtin_instructions(config: Dict[str, Any], model: str) -> str | None:
     base = config.get("BASE_INSTRUCTIONS", BASE_INSTRUCTIONS)
+    resolved_base = base if isinstance(base, str) and base.strip() else None
     if uses_codex_instructions(model):
-        codex = config.get("GPT5_CODEX_INSTRUCTIONS") or GPT5_CODEX_INSTRUCTIONS
+        codex = config.get("GPT5_CODEX_INSTRUCTIONS", GPT5_CODEX_INSTRUCTIONS)
         if isinstance(codex, str) and codex.strip():
             return codex
-    return base
+    return resolved_base
+
+
+def instructions_for_model(config: Dict[str, Any], model: str) -> str | None:
+    return resolve_builtin_instructions(config, model)
 
 
 def extract_client_session_id(headers: Any) -> str | None:
@@ -96,10 +132,16 @@ def normalize_responses_payload(
     if "store" not in normalized:
         normalized["store"] = False
 
-    instructions = normalized.get("instructions")
-    if not isinstance(instructions, str) or not instructions.strip():
-        instructions = instructions_for_model(config, normalized_model)
-        normalized["instructions"] = instructions
+    if should_inject_base_instructions(
+        config,
+        route_name="/v1/responses",
+        payload=normalized,
+    ):
+        instructions = resolve_builtin_instructions(config, normalized_model)
+        if instructions is not None:
+            normalized["instructions"] = instructions
+    if "instructions" not in normalized:
+        normalized["instructions"] = ""
 
     reasoning_effort = config.get("REASONING_EFFORT", "medium")
     reasoning_summary = config.get("REASONING_SUMMARY", "auto")
@@ -142,7 +184,7 @@ def normalize_responses_payload(
     normalized.pop("fast_mode", None)
 
     input_items = _input_items_for_session(normalized.get("input"))
-    session_id = ensure_session_id(instructions, input_items, client_session_id)
+    session_id = ensure_session_id(normalized.get("instructions"), input_items, client_session_id)
     prompt_cache_key = normalized.get("prompt_cache_key")
     if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
         normalized["prompt_cache_key"] = session_id

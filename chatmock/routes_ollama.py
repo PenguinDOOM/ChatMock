@@ -7,12 +7,15 @@ from typing import Any, Dict, List
 
 from flask import Blueprint, Response, current_app, jsonify, make_response, request, stream_with_context
 
-from .config import BASE_INSTRUCTIONS, GPT5_CODEX_INSTRUCTIONS
 from .fast_mode import resolve_service_tier
 from .limits import record_rate_limits_from_response
 from .http import build_cors_headers
 from .model_registry import list_public_models, uses_codex_instructions
-from .responses_api import instructions_for_model
+from .responses_api import (
+    instructions_for_model,
+    resolve_builtin_instructions,
+    should_inject_base_instructions,
+)
 from .reasoning import (
     allowed_efforts_for_model,
     build_reasoning_param,
@@ -72,7 +75,21 @@ def ollama_version() -> Response:
     return resp
 
 
-def _instructions_for_model(model: str) -> str:
+def _instructions_for_model(
+    model: str,
+    *,
+    payload: Dict[str, Any] | None = None,
+    route_name: str | None = None,
+) -> str | None:
+    if payload is not None and route_name is not None:
+        # For chat-style routes, fallback mode treats an explicit system message as client instructions.
+        if not should_inject_base_instructions(
+            current_app.config,
+            route_name=route_name,
+            payload=payload,
+        ):
+            return None
+        return resolve_builtin_instructions(current_app.config, model)
     return instructions_for_model(current_app.config, model)
 
 
@@ -189,12 +206,6 @@ def ollama_chat() -> Response:
     messages = convert_ollama_messages(
         raw_messages, payload.get("images") if isinstance(payload.get("images"), list) else None
     )
-    if isinstance(messages, list):
-        sys_idx = next((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"), None)
-        if isinstance(sys_idx, int):
-            sys_msg = messages.pop(sys_idx)
-            content = sys_msg.get("content") if isinstance(sys_msg, dict) else ""
-            messages.insert(0, {"role": "user", "content": content})
     stream_req = payload.get("stream")
     if stream_req is None:
         stream_req = True
@@ -204,50 +215,11 @@ def ollama_chat() -> Response:
     tool_choice = payload.get("tool_choice", "auto")
     parallel_tool_calls = bool(payload.get("parallel_tool_calls", False))
 
-    # Passthrough Responses API tools (web_search) via ChatMock extension fields
-    extra_tools: List[Dict[str, Any]] = []
-    had_responses_tools = False
-    rt_payload = payload.get("responses_tools") if isinstance(payload.get("responses_tools"), list) else []
-    if isinstance(rt_payload, list):
-        for _t in rt_payload:
-            if not (isinstance(_t, dict) and isinstance(_t.get("type"), str)):
-                continue
-            if _t.get("type") not in ("web_search", "web_search_preview"):
-                err = {"error": "Only web_search/web_search_preview are supported in responses_tools"}
-                if verbose:
-                    _log_json("OUT POST /api/chat", err)
-                return jsonify(err), 400
-            extra_tools.append(_t)
-        if not extra_tools and bool(current_app.config.get("DEFAULT_WEB_SEARCH")):
-            rtc = payload.get("responses_tool_choice")
-            if not (isinstance(rtc, str) and rtc == "none"):
-                extra_tools = [{"type": "web_search"}]
-        if extra_tools:
-            import json as _json
-            MAX_TOOLS_BYTES = 32768
-            try:
-                size = len(_json.dumps(extra_tools))
-            except Exception:
-                size = 0
-            if size > MAX_TOOLS_BYTES:
-                err = {"error": "responses_tools too large"}
-                if verbose:
-                    _log_json("OUT POST /api/chat", err)
-                return jsonify(err), 400
-            had_responses_tools = True
-            tools_responses = (tools_responses or []) + extra_tools
-
-    rtc = payload.get("responses_tool_choice")
-    if isinstance(rtc, str) and rtc in ("auto", "none"):
-        tool_choice = rtc
-
     if not isinstance(model, str) or not isinstance(messages, list) or not messages:
         err = {"error": "Invalid request format"}
         if verbose:
             _log_json("OUT POST /api/chat", err)
         return jsonify(err), 400
-
-    input_items = convert_chat_messages_to_responses_input(messages)
 
     model_reasoning = extract_reasoning_from_model_name(model)
     normalized_model = normalize_model_name(model, current_app.config.get("DEBUG_MODEL"))
@@ -264,10 +236,26 @@ def ollama_chat() -> Response:
         if verbose:
             _log_json("OUT POST /api/chat", err)
         return jsonify(err), 400
+    request_instructions = _instructions_for_model(
+        normalized_model,
+        payload=payload,
+        route_name="/api/chat",
+    )
+    if request_instructions is None:
+        sys_idx = next((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"), None)
+        if isinstance(sys_idx, int):
+            sys_msg = messages.pop(sys_idx)
+            content = sys_msg.get("content") if isinstance(sys_msg, dict) else ""
+            messages.insert(0, {"role": "user", "content": content})
+
+    input_items = convert_chat_messages_to_responses_input(
+        messages,
+        preserve_system_messages=request_instructions is not None,
+    )
     upstream, error_resp = start_upstream_request(
         normalized_model,
         input_items,
-        instructions=_instructions_for_model(normalized_model),
+        instructions=request_instructions,
         tools=tools_responses,
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
@@ -300,41 +288,12 @@ def ollama_chat() -> Response:
             err_body = json.loads(upstream.content.decode("utf-8", errors="ignore")) if upstream.content else {"raw": upstream.text}
         except Exception:
             err_body = {"raw": upstream.text}
-        if had_responses_tools:
-            if verbose:
-                print("[Passthrough] Upstream rejected tools; retrying without extras (args redacted)")
-            base_tools_only = convert_tools_chat_to_responses(normalize_ollama_tools(tools_req))
-            safe_choice = payload.get("tool_choice", "auto")
-            upstream2, err2 = start_upstream_request(
-                normalize_model_name(model, current_app.config.get("DEBUG_MODEL")),
-                input_items,
-                instructions=BASE_INSTRUCTIONS,
-                tools=base_tools_only,
-                tool_choice=safe_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                reasoning_param=build_reasoning_param(
-                    reasoning_effort,
-                    reasoning_summary,
-                    model_reasoning,
-                    allowed_efforts=allowed_efforts_for_model(model),
-                ),
-                service_tier=service_tier_resolution.service_tier,
-            )
-            record_rate_limits_from_response(upstream2)
-            if err2 is None and upstream2 is not None and upstream2.status_code < 400:
-                upstream = upstream2
-            else:
-                err = {"error": {"message": (err_body.get("error", {}) or {}).get("message", "Upstream error"), "code": "RESPONSES_TOOLS_REJECTED"}}
-                if verbose:
-                    _log_json("OUT POST /api/chat", err)
-                return jsonify(err), (upstream2.status_code if upstream2 is not None else upstream.status_code)
-        else:
-            if verbose:
-                print("/api/chat upstream error status=", upstream.status_code, " body:", json.dumps(err_body)[:2000])
-            err = {"error": (err_body.get("error", {}) or {}).get("message", "Upstream error")}
-            if verbose:
-                _log_json("OUT POST /api/chat", err)
-            return jsonify(err), upstream.status_code
+        if verbose:
+            print("/api/chat upstream error status=", upstream.status_code, " body:", json.dumps(err_body)[:2000])
+        err = {"error": (err_body.get("error", {}) or {}).get("message", "Upstream error")}
+        if verbose:
+            _log_json("OUT POST /api/chat", err)
+        return jsonify(err), upstream.status_code
 
     created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     model_out = model if isinstance(model, str) and model.strip() else normalized_model

@@ -32,14 +32,11 @@ def _read_prompt_text(filename: str) -> str | None:
     return None
 
 
-def read_base_instructions() -> str:
-    content = _read_prompt_text("prompt.md")
-    if content is None:
-        raise FileNotFoundError("Failed to read prompt.md; expected adjacent to package or CWD.")
-    return content
+def read_base_instructions() -> str | None:
+    return _read_prompt_text("prompt.md")
 
 
-def read_gpt5_codex_instructions(fallback: str) -> str:
+def read_gpt5_codex_instructions(fallback: str | None) -> str | None:
     content = _read_prompt_text("prompt_gpt5_codex.md")
     return content if isinstance(content, str) and content.strip() else fallback
 
