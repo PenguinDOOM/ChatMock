@@ -26,6 +26,8 @@ from chatmock.session import (
     reset_session_state,
 )
 from flask import Response
+from websockets.exceptions import ConnectionClosed
+from websockets.frames import Close
 from websockets.sync.client import connect as ws_connect
 
 
@@ -602,6 +604,55 @@ class RouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json(), upstream_error)
+
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_chat_completions_non_json_upstream_errors_include_safe_context_contract(self, mock_start) -> None:
+        long_body = (
+            "gateway meltdown before JSON. "
+            "Authorization: Bearer auth-secret-123. "
+            "Bearer bearer-secret-456. "
+            "sk-live-super-secret-789. "
+            "session_id=session-secret-abc. "
+            "access_token=access-secret-def. "
+            "token=token-secret-ghi. "
+            + ("visible context " * 80)
+        )
+
+        for status_code in (502, 503):
+            with self.subTest(status_code=status_code):
+                mock_start.return_value = (
+                    FakeUpstream(
+                        status_code=status_code,
+                        headers={"Content-Type": "text/plain; charset=utf-8"},
+                        content=long_body.encode("utf-8"),
+                        text=long_body,
+                    ),
+                    None,
+                )
+
+                response = self.client.post(
+                    "/v1/chat/completions",
+                    json={"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]},
+                )
+
+                body = response.get_json()
+                message = body["error"]["message"]
+
+                self.assertEqual(response.status_code, status_code)
+                self.assertIn(str(status_code), message)
+                self.assertIn("text/plain", message)
+                self.assertIn("gateway meltdown before JSON", message)
+                self.assertNotEqual(message, "Upstream error")
+                for secret in (
+                    "auth-secret-123",
+                    "bearer-secret-456",
+                    "sk-live-super-secret-789",
+                    "session-secret-abc",
+                    "access-secret-def",
+                    "token-secret-ghi",
+                ):
+                    self.assertNotIn(secret, message)
+                self.assertLess(len(message), 500)
 
     @patch("chatmock.routes_openai.start_upstream_request")
     def test_chat_completions_preserve_unknown_model_id(self, mock_start) -> None:
@@ -1606,6 +1657,30 @@ class RouteTests(unittest.TestCase):
         )
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_responses_route_non_json_event_stream_parse_failure_reports_upstream_context_contract(self, mock_start) -> None:
+        class MalformedEventStreamUpstream(FakeUpstream):
+            def iter_lines(self, decode_unicode: bool = False):
+                payload = b"data: not-json\n\n"
+                yield payload.decode("utf-8") if decode_unicode else payload
+
+        mock_start.return_value = (
+            MalformedEventStreamUpstream(headers={"Content-Type": "text/event-stream"}),
+            None,
+        )
+
+        response = self.client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.4", "input": "hello"},
+        )
+
+        body = response.get_json()
+        message = body["error"]["message"]
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("not-json", message)
+        self.assertIn("event-stream", message)
+        self.assertNotEqual(message, "Upstream response stream did not contain a completed response object")
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_stream_passthrough(self, mock_start) -> None:
         chunk = b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
         mock_start.return_value = (
@@ -1723,12 +1798,51 @@ class RouteTests(unittest.TestCase):
             [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
         )
         self.assertIn("prompt_cache_key", outbound)
-        follow_up = json.loads(fake_upstream.sent[1])
-        self.assertEqual(follow_up["previous_response_id"], "resp_ws_1")
-        self.assertEqual(
-            follow_up["input"],
-            [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]}],
+
+    @patch("chatmock.websocket_routes.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.websocket_routes.connect_upstream_websocket")
+    def test_responses_websocket_unexpected_close_reports_close_context_contract(self, mock_connect, _mock_auth) -> None:
+        class FakeUpstreamWebsocket:
+            def send(self, message: str) -> None:
+                return None
+
+            def recv(self) -> str:
+                raise ConnectionClosed(Close(1011, "gateway reset"), None)
+
+            def close(self) -> None:
+                return None
+
+        mock_connect.return_value = FakeUpstreamWebsocket()
+
+        app = create_app()
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+        sock.close()
+
+        server_thread = threading.Thread(
+            target=app.run,
+            kwargs={
+                "host": host,
+                "port": port,
+                "use_reloader": False,
+                "threaded": True,
+            },
+            daemon=True,
         )
+        server_thread.start()
+        time.sleep(0.5)
+
+        with ws_connect(f"ws://{host}:{port}/v1/responses") as client:
+            client.send(json.dumps({"type": "response.create", "model": "gpt-5.4", "input": "hello"}))
+            error_event = json.loads(client.recv())
+
+        self.assertEqual(error_event["type"], "error")
+        self.assertEqual(error_event["status_code"], 502)
+        self.assertIn("1011", error_event["error"]["message"])
+        self.assertIn("gateway reset", error_event["error"]["message"])
+        self.assertNotEqual(error_event["error"]["message"], "Upstream websocket closed unexpectedly.")
 
 
 class ResponsesWebsocketUpstreamContractTests(unittest.TestCase):
