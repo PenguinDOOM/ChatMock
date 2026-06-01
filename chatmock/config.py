@@ -9,7 +9,8 @@ CLIENT_ID_DEFAULT = os.getenv("CHATGPT_LOCAL_CLIENT_ID") or "app_EMoamEEZ73f0CkX
 OAUTH_ISSUER_DEFAULT = os.getenv("CHATGPT_LOCAL_ISSUER") or "https://auth.openai.com"
 OAUTH_TOKEN_URL = f"{OAUTH_ISSUER_DEFAULT}/oauth/token"
 
-CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+# The contract harness overrides this to keep outbound /v1/responses runs deterministic.
+CHATGPT_RESPONSES_URL = os.getenv("CHATGPT_RESPONSES_URL") or "https://chatgpt.com/backend-api/codex/responses"
 
 
 def _read_prompt_text(filename: str) -> str | None:

@@ -14,6 +14,19 @@ We welcome thoughtful improvements. This guide calls out the expectations that k
 - Go through the codebase, and ensure you understand the current codebase. 
 - Confirm you can log in and serve a local instance, then make a couple of sample requests to understand current behaviour so you know if it broke later on.
 
+### Running The Phase 1 Contract Harness
+- The black-box contract suite lives under `tests/contract/` and talks to ChatMock over HTTP only.
+- To let the harness start the current Python server with a deterministic fake upstream, run from the repo root with `CHATMOCK_SERVER_CMD="python -m chatmock.cli serve" python -m unittest tests.contract.test_cli_contract tests.contract.test_openai_http_contract`.
+- If you already have a target server running, set `CHATMOCK_BASE_URL` instead of `CHATMOCK_SERVER_CMD` and run the same `python -m unittest ...` command.
+- To exercise the Phase 1 Rust target before the Rust server exists, run `CHATMOCK_CONTRACT_TARGET=rust python -m unittest tests.contract.test_cli_contract tests.contract.test_openai_http_contract`. In this phase that should skip with an explicit missing-server reason unless you also provide `CHATMOCK_BASE_URL` or `CHATMOCK_SERVER_CMD` for a Rust target.
+
+### Working On chatmock-rs
+- Run Rust development checks from `chatmock-rs/`.
+- Build the workspace with `cargo build`.
+- Check formatting with `cargo fmt --check`.
+- Keep lints clean with `cargo clippy --all-targets -- -D warnings`.
+- Run the Rust test suite with `cargo test`.
+
 ### Working With Core Files
 - `prompt.md` and related Codex harness files are sensitive. Do not modify them or move entry points without prior maintainer approval.
 - Be cautious with parameter names, response payload shapes, and file locations consumed by downstream clients. Coordinate before changing them.
