@@ -1,0 +1,178 @@
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    response::Response,
+    routing::post,
+    Router,
+};
+use serde_json::Value;
+
+use crate::{
+    routes::{error_response, event_stream_response, json_response},
+    sse::{self, SseInspection},
+    upstream,
+    upstream_errors::{build_upstream_error, UpstreamErrorContext},
+};
+
+pub(crate) fn router() -> Router<crate::server::AppState> {
+    Router::new().route("/v1/responses", post(responses_create))
+}
+
+async fn responses_create(
+    State(state): State<crate::server::AppState>,
+    request: Request,
+) -> Response {
+    let headers = request.headers().clone();
+    let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body"),
+    };
+    let payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(payload)) => payload,
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Request body must be a JSON object",
+            )
+        }
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body"),
+    };
+
+    let normalized = match crate::responses::normalize_responses_payload(
+        &payload,
+        &state.responses_config,
+        crate::routes::client_session_id(&headers),
+    ) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            let mut payload = serde_json::json!({
+                "error": {
+                    "message": error.message,
+                }
+            });
+            if let Some(code) = error.code {
+                payload["error"]["code"] = Value::String(code);
+            }
+            return json_response(
+                StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_REQUEST),
+                payload,
+            );
+        }
+    };
+
+    let stream = normalized
+        .payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut upstream_payload = normalized.payload.clone();
+    upstream_payload.remove("previous_response_id");
+    upstream_payload.insert("stream".to_string(), Value::Bool(true));
+
+    let upstream = match upstream::start_upstream_raw_request(
+        &state,
+        Value::Object(upstream_payload),
+        Some(&normalized.session_id),
+        true,
+    )
+    .await
+    {
+        Ok(upstream) => upstream,
+        Err(response) => return response,
+    };
+
+    if upstream.status_code.is_client_error() || upstream.status_code.is_server_error() {
+        if let Ok(parsed_error) = serde_json::from_slice::<Value>(&upstream.body) {
+            if parsed_error.is_object() {
+                return json_response(upstream.status_code, parsed_error);
+            }
+        }
+        return json_response(
+            upstream.status_code,
+            serde_json::to_value(build_upstream_error(
+                Some("Upstream error"),
+                UpstreamErrorContext {
+                    status_code: Some(upstream.status_code.as_u16()),
+                    body: Some(upstream.body.clone()),
+                    content_type: upstream.content_type.clone(),
+                    ..UpstreamErrorContext::default()
+                },
+            ))
+            .expect("upstream error payload"),
+        );
+    }
+
+    if stream {
+        return event_stream_response(upstream.status_code, upstream.body);
+    }
+
+    if upstream
+        .content_type
+        .as_deref()
+        .map(|value| value.to_ascii_lowercase().contains("application/json"))
+        .unwrap_or(false)
+    {
+        if let Ok(body) = serde_json::from_slice::<Value>(&upstream.body) {
+            if body.is_object() {
+                return json_response(upstream.status_code, body);
+            }
+        }
+    }
+
+    let mut inspection = SseInspection::default();
+    let (response_obj, error_obj) =
+        sse::aggregate_response_from_sse(&upstream.body, Some(&mut inspection));
+    if let Some(error_obj) = error_obj {
+        let is_detailed_error = error_obj
+            .get("error")
+            .and_then(Value::as_object)
+            .map(|error| {
+                error.get("message").and_then(Value::as_str) != Some("response.failed")
+                    || error.len() > 1
+            })
+            .unwrap_or(false);
+        if is_detailed_error {
+            return json_response(StatusCode::BAD_GATEWAY, error_obj);
+        }
+        return json_response(
+            StatusCode::BAD_GATEWAY,
+            serde_json::to_value(build_upstream_error(
+                Some("Upstream response failed"),
+                UpstreamErrorContext {
+                    phase: Some("response.failed".to_string()),
+                    content_type: upstream.content_type.clone(),
+                    body: inspection
+                        .invalid_event_data
+                        .or(inspection.last_event_data)
+                        .map(|body| body.into_bytes()),
+                    ..UpstreamErrorContext::default()
+                },
+            ))
+            .expect("upstream error payload"),
+        );
+    }
+
+    if response_obj.is_none() || !inspection.completed_seen {
+        return json_response(
+            StatusCode::BAD_GATEWAY,
+            serde_json::to_value(build_upstream_error(
+                Some("Upstream response stream did not contain a completed response object"),
+                UpstreamErrorContext {
+                    phase: Some("response.completed".to_string()),
+                    content_type: upstream.content_type.clone(),
+                    body: inspection
+                        .invalid_event_data
+                        .or(inspection.last_event_data)
+                        .map(|body| body.into_bytes()),
+                    ..UpstreamErrorContext::default()
+                },
+            ))
+            .expect("upstream error payload"),
+        );
+    }
+
+    json_response(
+        upstream.status_code,
+        response_obj.expect("checked response object"),
+    )
+}

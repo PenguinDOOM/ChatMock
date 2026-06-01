@@ -1,6 +1,7 @@
-use std::net::SocketAddr;
+use std::{env, net::SocketAddr, path::PathBuf};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use reqwest::Client;
 use serde::Serialize;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -8,11 +9,17 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::{
     config::{Cli, Command, RuntimeConfig},
     errors::AppError,
+    prompts::{read_prompt_text, PromptLookup},
+    protocol::ResponsesConfig,
 };
 
 #[derive(Debug, Clone)]
-struct AppState {
-    bind_address: SocketAddr,
+pub(crate) struct AppState {
+    pub(crate) bind_address: SocketAddr,
+    pub(crate) responses_config: ResponsesConfig,
+    pub(crate) reasoning_compat: String,
+    pub(crate) expose_reasoning_models: bool,
+    pub(crate) http_client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,9 +71,17 @@ pub async fn serve(listener: TcpListener) -> Result<(), AppError> {
 }
 
 fn app(bind_address: SocketAddr) -> Router {
+    let responses_config = default_responses_config();
     Router::new()
         .route("/health", get(health))
-        .with_state(AppState { bind_address })
+        .merge(crate::routes::openai_router())
+        .with_state(AppState {
+            bind_address,
+            responses_config,
+            reasoning_compat: "think-tags".to_string(),
+            expose_reasoning_models: false,
+            http_client: Client::new(),
+        })
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -74,6 +89,27 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         status: "ok",
         bind_address: state.bind_address.to_string(),
     })
+}
+
+fn default_responses_config() -> ResponsesConfig {
+    let lookup = PromptLookup {
+        repo_root: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        module_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        meipass_dir: env::var_os("_MEIPASS").map(PathBuf::from),
+        cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let base_instructions = read_prompt_text("prompt.md", &lookup);
+    let gpt5_codex_instructions =
+        read_prompt_text("prompt_gpt5_codex.md", &lookup).or_else(|| base_instructions.clone());
+
+    ResponsesConfig {
+        base_instructions,
+        gpt5_codex_instructions,
+        ..ResponsesConfig::default()
+    }
 }
 
 pub struct RunningServer {

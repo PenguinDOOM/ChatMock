@@ -237,7 +237,7 @@ pub fn canonicalize_responses_input(raw_input: &Value) -> Value {
     }
 }
 
-fn ensure_session_id(
+pub fn ensure_session_id(
     instructions: &str,
     input_items: &[Value],
     client_session_id: Option<&str>,

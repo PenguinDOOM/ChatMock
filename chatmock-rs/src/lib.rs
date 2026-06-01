@@ -7,7 +7,10 @@ pub mod prompts;
 pub mod protocol;
 pub mod reasoning;
 pub mod responses;
+pub mod routes;
 pub mod server;
+pub mod sse;
+pub mod upstream;
 pub mod upstream_errors;
 
 pub use config::{Cli, RuntimeConfig, ServeArgs};
