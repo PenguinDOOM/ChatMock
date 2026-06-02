@@ -65,20 +65,57 @@ async fn responses_create(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let previous_response_id = normalized
+        .payload
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let mut upstream_payload = normalized.payload.clone();
-    upstream_payload.remove("previous_response_id");
+    if state.responses_websocket_registry.is_none() {
+        upstream_payload.remove("previous_response_id");
+    }
     upstream_payload.insert("stream".to_string(), Value::Bool(true));
+    let upstream_payload = Value::Object(upstream_payload);
 
-    let upstream = match upstream::start_upstream_raw_request(
-        &state,
-        Value::Object(upstream_payload),
-        Some(&normalized.session_id),
-        true,
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(response) => return response,
+    let upstream = if let (Some(connector), Some(registry)) = (
+        state.responses_websocket_connector.as_ref(),
+        state.responses_websocket_registry.as_ref(),
+    ) {
+        match crate::websocket::upstream::send_stateful_responses_create_request(
+            connector,
+            registry,
+            &normalized.session_id,
+            upstream_payload.clone(),
+            previous_response_id.as_deref(),
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(response) => return response,
+        }
+    } else if let Some(connector) = state.responses_websocket_connector.as_ref() {
+        match crate::websocket::upstream::send_responses_create_request(
+            connector,
+            &normalized.session_id,
+            upstream_payload.clone(),
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(response) => return response,
+        }
+    } else {
+        match upstream::start_upstream_raw_request(
+            &state,
+            upstream_payload,
+            Some(&normalized.session_id),
+            true,
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(response) => return response,
+        }
     };
 
     if upstream.status_code.is_client_error() || upstream.status_code.is_server_error() {

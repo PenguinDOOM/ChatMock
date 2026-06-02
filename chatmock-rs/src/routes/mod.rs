@@ -18,6 +18,7 @@ pub(crate) fn openai_router() -> Router<crate::server::AppState> {
         .merge(models::router())
         .merge(chat_completions::router())
         .merge(completions::router())
+        .merge(crate::websocket::client_route::router())
         .merge(responses::router())
 }
 

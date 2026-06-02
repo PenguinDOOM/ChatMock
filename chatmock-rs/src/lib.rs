@@ -12,6 +12,7 @@ pub mod server;
 pub mod sse;
 pub mod upstream;
 pub mod upstream_errors;
+pub mod websocket;
 
 pub use config::{Cli, RuntimeConfig, ServeArgs};
 pub use errors::{AppError, ConfigError};

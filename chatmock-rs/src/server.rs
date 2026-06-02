@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use reqwest::Client;
@@ -11,15 +11,42 @@ use crate::{
     errors::AppError,
     prompts::{read_prompt_text, PromptLookup},
     protocol::ResponsesConfig,
+    websocket::registry::RetainedUpstreamWebsocketRegistry,
+    websocket::upstream::{ResponsesWebsocketConnector, ResponsesWebsocketConnectorFn},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) bind_address: SocketAddr,
     pub(crate) responses_config: ResponsesConfig,
     pub(crate) reasoning_compat: String,
     pub(crate) expose_reasoning_models: bool,
     pub(crate) http_client: Client,
+    pub(crate) responses_websocket_connector: Option<ResponsesWebsocketConnector>,
+    pub(crate) responses_websocket_registry: Option<
+        Arc<RetainedUpstreamWebsocketRegistry<crate::websocket::upstream::SharedUpstreamWebsocket>>,
+    >,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppState")
+            .field("bind_address", &self.bind_address)
+            .field("responses_config", &self.responses_config)
+            .field("reasoning_compat", &self.reasoning_compat)
+            .field("expose_reasoning_models", &self.expose_reasoning_models)
+            .field("http_client", &self.http_client)
+            .field(
+                "responses_websocket_connector",
+                &self.responses_websocket_connector,
+            )
+            .field(
+                "responses_websocket_registry",
+                &self.responses_websocket_registry,
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -48,7 +75,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), AppError> {
 
 pub async fn run(config: RuntimeConfig) -> Result<(), AppError> {
     let listener = bind(&config).await?;
-    serve(listener).await
+    serve_with_config(listener, config, None).await
 }
 
 pub async fn bind(config: &RuntimeConfig) -> Result<TcpListener, AppError> {
@@ -64,24 +91,53 @@ fn validated_bind_address(config: &RuntimeConfig) -> Result<SocketAddr, AppError
 }
 
 pub async fn serve(listener: TcpListener) -> Result<(), AppError> {
+    serve_with_config(listener, RuntimeConfig::default(), None).await
+}
+
+async fn serve_with_config(
+    listener: TcpListener,
+    config: RuntimeConfig,
+    responses_websocket_connector: Option<ResponsesWebsocketConnector>,
+) -> Result<(), AppError> {
     let address = listener.local_addr()?;
-    let app = app(address);
+    let app = app(build_app_state(
+        address,
+        &config,
+        responses_websocket_connector,
+    ));
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-fn app(bind_address: SocketAddr) -> Router {
-    let responses_config = default_responses_config();
+fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(crate::routes::openai_router())
-        .with_state(AppState {
-            bind_address,
-            responses_config,
-            reasoning_compat: "think-tags".to_string(),
-            expose_reasoning_models: false,
-            http_client: Client::new(),
-        })
+        .with_state(state)
+}
+
+fn build_app_state(
+    bind_address: SocketAddr,
+    config: &RuntimeConfig,
+    responses_websocket_connector: Option<ResponsesWebsocketConnector>,
+) -> AppState {
+    let responses_config = default_responses_config();
+    let responses_websocket_registry = if config.responses_websocket_upstream_stateful
+        && responses_websocket_connector.is_some()
+    {
+        Some(Arc::new(RetainedUpstreamWebsocketRegistry::new(64)))
+    } else {
+        None
+    };
+    AppState {
+        bind_address,
+        responses_config,
+        reasoning_compat: "think-tags".to_string(),
+        expose_reasoning_models: false,
+        http_client: Client::new(),
+        responses_websocket_connector,
+        responses_websocket_registry,
+    }
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -132,7 +188,19 @@ impl Drop for RunningServer {
 pub async fn spawn_server(config: RuntimeConfig) -> Result<RunningServer, AppError> {
     let listener = bind(&config).await?;
     let address = listener.local_addr()?;
-    let task = tokio::spawn(async move { serve(listener).await });
+    let task = tokio::spawn(async move { serve_with_config(listener, config, None).await });
+    Ok(RunningServer { address, task })
+}
+
+pub async fn spawn_server_with_websocket_connector(
+    config: RuntimeConfig,
+    connector: std::sync::Arc<ResponsesWebsocketConnectorFn>,
+) -> Result<RunningServer, AppError> {
+    let listener = bind(&config).await?;
+    let address = listener.local_addr()?;
+    let connector = ResponsesWebsocketConnector::new(connector);
+    let task =
+        tokio::spawn(async move { serve_with_config(listener, config, Some(connector)).await });
     Ok(RunningServer { address, task })
 }
 
