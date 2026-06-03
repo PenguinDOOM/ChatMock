@@ -416,7 +416,7 @@ async fn completions_missing_auth_returns_401_with_cors_headers() {
     let body: Value = response.json().await.expect("missing auth json");
     assert_eq!(
         body["error"]["message"],
-        "Missing ChatGPT credentials. Run 'python3 chatmock.py login' first."
+        "Missing ChatGPT credentials. Run 'chatmock-rs login' first."
     );
 }
 

@@ -1,6 +1,6 @@
 # Docker Deployment
 
-## Quick Start
+## Quick Start (Python, current default)
 1) Setup env:
    cp .env.example .env
 
@@ -15,6 +15,31 @@
    docker compose up -d chatmock
 
 4) Free to use it in whichever chat app you like!
+
+Python remains the default Docker path for now. The current Python services are `chatmock` and `chatmock-login`.
+
+## Rust (validated optional path)
+Rust Docker services are available and validated, but they are not the default path yet.
+
+- Serve service: `chatmock-rust` under profile `rust`
+- Login service: `chatmock-rust-login` under profile `rust-login`
+- The Rust image builds from `chatmock-rs/Dockerfile`
+- The serve container listens on port `8000`
+- The serve container responds on `/health` and `/v1/models`
+- The Rust container respects auth state at mounted `/data/auth.json`
+- The login container starts the login flow on port `1455` and prints the auth URL
+
+Start the Rust server:
+
+```bash
+docker compose --profile rust up -d chatmock-rust
+```
+
+Run Rust login:
+
+```bash
+docker compose --profile rust-login run --rm --service-ports chatmock-rust-login login
+```
 
 ## Configuration
 Set options in `.env` or pass environment variables:

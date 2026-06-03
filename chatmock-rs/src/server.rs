@@ -7,13 +7,21 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    config::{Cli, Command, RuntimeConfig},
+    config::RuntimeConfig,
     errors::AppError,
     prompts::{read_prompt_text, PromptLookup},
     protocol::ResponsesConfig,
     websocket::registry::RetainedUpstreamWebsocketRegistry,
     websocket::upstream::{ResponsesWebsocketConnector, ResponsesWebsocketConnectorFn},
 };
+
+const DEBUG_MODEL_ENV: &str = "CHATGPT_LOCAL_DEBUG_MODEL";
+const FAST_MODE_ENV: &str = "CHATGPT_LOCAL_FAST_MODE";
+const REASONING_EFFORT_ENV: &str = "CHATGPT_LOCAL_REASONING_EFFORT";
+const REASONING_SUMMARY_ENV: &str = "CHATGPT_LOCAL_REASONING_SUMMARY";
+const ENABLE_WEB_SEARCH_ENV: &str = "CHATGPT_LOCAL_ENABLE_WEB_SEARCH";
+const REASONING_COMPAT_ENV: &str = "CHATGPT_LOCAL_REASONING_COMPAT";
+const EXPOSE_REASONING_MODELS_ENV: &str = "CHATGPT_LOCAL_EXPOSE_REASONING_MODELS";
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -62,15 +70,6 @@ pub fn init_tracing() {
         )
         .with(tracing_subscriber::fmt::layer())
         .try_init();
-}
-
-pub async fn run_cli(cli: Cli) -> Result<(), AppError> {
-    match cli.command {
-        Command::Serve(args) => {
-            let config = RuntimeConfig::from_sources(args)?;
-            run(config).await
-        }
-    }
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), AppError> {
@@ -132,8 +131,10 @@ fn build_app_state(
     AppState {
         bind_address,
         responses_config,
-        reasoning_compat: "think-tags".to_string(),
-        expose_reasoning_models: false,
+        reasoning_compat: read_string_env(REASONING_COMPAT_ENV)
+            .unwrap_or_else(|| "think-tags".to_string())
+            .to_ascii_lowercase(),
+        expose_reasoning_models: read_bool_env(EXPOSE_REASONING_MODELS_ENV),
         http_client: Client::new(),
         responses_websocket_connector,
         responses_websocket_registry,
@@ -162,10 +163,32 @@ fn default_responses_config() -> ResponsesConfig {
         read_prompt_text("prompt_gpt5_codex.md", &lookup).or_else(|| base_instructions.clone());
 
     ResponsesConfig {
+        debug_model: read_string_env(DEBUG_MODEL_ENV),
         base_instructions,
         gpt5_codex_instructions,
+        reasoning_effort: read_string_env(REASONING_EFFORT_ENV)
+            .unwrap_or_else(|| "medium".to_string())
+            .to_ascii_lowercase(),
+        reasoning_summary: read_string_env(REASONING_SUMMARY_ENV)
+            .unwrap_or_else(|| "auto".to_string())
+            .to_ascii_lowercase(),
+        default_web_search: read_bool_env(ENABLE_WEB_SEARCH_ENV),
+        fast_mode: read_bool_env(FAST_MODE_ENV),
         ..ResponsesConfig::default()
     }
+}
+
+fn read_string_env(name: &str) -> Option<String> {
+    env::var(name).ok()
+}
+
+fn read_bool_env(name: &str) -> bool {
+    matches!(
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    )
 }
 
 pub struct RunningServer {
@@ -208,6 +231,50 @@ pub async fn spawn_server_with_websocket_connector(
 mod tests {
     use super::bind;
     use crate::{AppError, ConfigError, RuntimeConfig};
+    use std::ffi::OsString;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::{Mutex, OnceLock};
+
+    const SERVER_ENV_VARS: &[&str] = &[
+        "CHATGPT_LOCAL_DEBUG_MODEL",
+        "CHATGPT_LOCAL_FAST_MODE",
+        "CHATGPT_LOCAL_REASONING_EFFORT",
+        "CHATGPT_LOCAL_REASONING_SUMMARY",
+        "CHATGPT_LOCAL_ENABLE_WEB_SEARCH",
+        "CHATGPT_LOCAL_REASONING_COMPAT",
+        "CHATGPT_LOCAL_EXPOSE_REASONING_MODELS",
+    ];
+
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                saved: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[tokio::test]
     async fn bind_rejects_invalid_programmatic_stateful_config() {
@@ -223,5 +290,41 @@ mod tests {
             err,
             AppError::Config(ConfigError::StatefulRequiresWebsocketUpstream)
         ));
+    }
+
+    #[test]
+    fn default_responses_config_uses_phase6_env_overrides() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _saved = EnvVarGuard::capture(SERVER_ENV_VARS);
+        std::env::set_var("CHATGPT_LOCAL_DEBUG_MODEL", "gpt-5.4-debug");
+        std::env::set_var("CHATGPT_LOCAL_FAST_MODE", "yes");
+        std::env::set_var("CHATGPT_LOCAL_REASONING_EFFORT", "xhigh");
+        std::env::set_var("CHATGPT_LOCAL_REASONING_SUMMARY", "detailed");
+        std::env::set_var("CHATGPT_LOCAL_ENABLE_WEB_SEARCH", "true");
+
+        let config = super::default_responses_config();
+
+        assert_eq!(config.debug_model.as_deref(), Some("gpt-5.4-debug"));
+        assert!(config.fast_mode);
+        assert_eq!(config.reasoning_effort, "xhigh");
+        assert_eq!(config.reasoning_summary, "detailed");
+        assert!(config.default_web_search);
+    }
+
+    #[test]
+    fn build_app_state_uses_reasoning_env_overrides() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _saved = EnvVarGuard::capture(SERVER_ENV_VARS);
+        std::env::set_var("CHATGPT_LOCAL_REASONING_COMPAT", "legacy");
+        std::env::set_var("CHATGPT_LOCAL_EXPOSE_REASONING_MODELS", "true");
+
+        let state = super::build_app_state(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
+            &RuntimeConfig::default(),
+            None,
+        );
+
+        assert_eq!(state.reasoning_compat, "legacy");
+        assert!(state.expose_reasoning_models);
     }
 }

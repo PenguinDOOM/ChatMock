@@ -1,6 +1,5 @@
 use std::{
     env,
-    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,12 +11,14 @@ use reqwest::StatusCode;
 use serde_json::{Map, Value};
 
 use crate::{
-    auth::read_auth_file,
+    auth::{load_effective_chatgpt_auth_from_env_with_refresher, RefreshedAuthTokens},
     routes::error_response,
     upstream_errors::{build_upstream_error, UpstreamErrorContext},
 };
 
 const DEFAULT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const DEFAULT_CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const DEFAULT_OAUTH_ISSUER: &str = "https://auth.openai.com";
 
 #[derive(Debug, Clone)]
 pub struct UpstreamResponse {
@@ -95,12 +96,19 @@ pub(crate) async fn start_upstream_raw_request(
     session_id: Option<&str>,
     stream: bool,
 ) -> Result<UpstreamResponse, Response> {
-    let (access_token, account_id) = match effective_chatgpt_auth() {
+    let http_client = state.http_client.clone();
+    let effective_auth =
+        load_effective_chatgpt_auth_from_env_with_refresher(move |refresh_token| {
+            let http_client = http_client.clone();
+            async move { refresh_chatgpt_tokens(http_client, refresh_token).await }
+        })
+        .await;
+    let effective_auth = match effective_auth {
         Some(credentials) => credentials,
         None => {
             return Err(error_response(
                 StatusCode::UNAUTHORIZED,
-                "Missing ChatGPT credentials. Run 'python3 chatmock.py login' first.",
+                "Missing ChatGPT credentials. Run 'chatmock-rs login' first.",
             ))
         }
     };
@@ -110,8 +118,8 @@ pub(crate) async fn start_upstream_raw_request(
         .http_client
         .post(upstream_url())
         .headers(build_upstream_headers(
-            &access_token,
-            &account_id,
+            &effective_auth.access_token,
+            &effective_auth.account_id,
             &effective_session_id,
             if stream {
                 "text/event-stream"
@@ -215,21 +223,58 @@ fn effective_session_id(session_id: Option<&str>, responses_payload: &Value) -> 
         .unwrap_or_else(|_| "0".to_string())
 }
 
-fn effective_chatgpt_auth() -> Option<(String, String)> {
-    let chatgpt_local_home = env_path("CHATGPT_LOCAL_HOME");
-    let codex_home = env_path("CODEX_HOME");
-    let user_home = env_path("USERPROFILE").or_else(|| env_path("HOME"));
-    let auth_file = read_auth_file(
-        chatgpt_local_home.as_deref(),
-        codex_home.as_deref(),
-        user_home.as_deref(),
-    )?;
-    let tokens = auth_file.tokens?;
-    let access_token = tokens.access_token?;
-    let account_id = tokens.account_id?;
-    Some((access_token, account_id))
-}
+async fn refresh_chatgpt_tokens(
+    http_client: reqwest::Client,
+    refresh_token: String,
+) -> Option<RefreshedAuthTokens> {
+    let client_id = env::var("CHATGPT_LOCAL_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CHATGPT_CLIENT_ID.to_string());
+    let issuer = env::var("CHATGPT_LOCAL_ISSUER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_OAUTH_ISSUER.to_string());
+    let token_url = format!("{}/oauth/token", issuer.trim_end_matches('/'));
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    env::var_os(name).map(PathBuf::from)
+    let response = http_client
+        .post(token_url)
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "scope": "openid profile email offline_access",
+        }))
+        .send()
+        .await
+        .ok()?;
+
+    if response.status().is_client_error() || response.status().is_server_error() {
+        return None;
+    }
+
+    let payload: Value = response.json().await.ok()?;
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())?;
+    let id_token = payload
+        .get("id_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())?;
+    let refresh_token = payload
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(refresh_token);
+
+    Some(RefreshedAuthTokens {
+        access_token: Some(access_token),
+        account_id: None,
+        id_token: Some(id_token),
+        refresh_token: Some(refresh_token),
+    })
 }

@@ -1,7 +1,10 @@
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod errors;
 pub mod fast_mode;
+pub mod info;
+pub mod login;
 pub mod models;
 pub mod prompts;
 pub mod protocol;
@@ -14,5 +17,5 @@ pub mod upstream;
 pub mod upstream_errors;
 pub mod websocket;
 
-pub use config::{Cli, RuntimeConfig, ServeArgs};
+pub use config::{Cli, Command, InfoArgs, LoginArgs, RuntimeConfig, ServeArgs};
 pub use errors::{AppError, ConfigError};

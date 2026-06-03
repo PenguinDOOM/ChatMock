@@ -22,7 +22,24 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Login(LoginArgs),
     Serve(ServeArgs),
+    Info(InfoArgs),
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct LoginArgs {
+    #[arg(long)]
+    pub no_browser: bool,
+
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct InfoArgs {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -36,8 +53,22 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub responses_websocket_upstream: bool,
 
+    #[arg(
+        long = "no-responses-websocket-upstream",
+        default_value_t = false,
+        conflicts_with = "responses_websocket_upstream"
+    )]
+    pub no_responses_websocket_upstream: bool,
+
     #[arg(long, default_value_t = false)]
     pub responses_websocket_upstream_stateful: bool,
+
+    #[arg(
+        long = "no-responses-websocket-upstream-stateful",
+        default_value_t = false,
+        conflicts_with = "responses_websocket_upstream_stateful"
+    )]
+    pub no_responses_websocket_upstream_stateful: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,10 +100,16 @@ impl RuntimeConfig {
             Some(port) => port,
             None => read_port_env(PORT_ENV)?.unwrap_or(DEFAULT_PORT),
         };
-        let responses_websocket_upstream =
-            args.responses_websocket_upstream || read_bool_env(RESPONSES_WEBSOCKET_UPSTREAM_ENV)?;
-        let responses_websocket_upstream_stateful = args.responses_websocket_upstream_stateful
-            || read_bool_env(RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL_ENV)?;
+        let responses_websocket_upstream = resolve_bool_flag(
+            args.responses_websocket_upstream,
+            args.no_responses_websocket_upstream,
+            RESPONSES_WEBSOCKET_UPSTREAM_ENV,
+        )?;
+        let responses_websocket_upstream_stateful = resolve_bool_flag(
+            args.responses_websocket_upstream_stateful,
+            args.no_responses_websocket_upstream_stateful,
+            RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL_ENV,
+        )?;
 
         let config = Self {
             host,
@@ -100,6 +137,20 @@ impl RuntimeConfig {
 
         Ok(())
     }
+}
+
+fn resolve_bool_flag(
+    enabled: bool,
+    disabled: bool,
+    env_name: &'static str,
+) -> Result<bool, ConfigError> {
+    if enabled {
+        return Ok(true);
+    }
+    if disabled {
+        return Ok(false);
+    }
+    read_bool_env(env_name)
 }
 
 fn read_port_env(name: &'static str) -> Result<Option<u16>, ConfigError> {

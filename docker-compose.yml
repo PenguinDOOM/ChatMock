@@ -3,7 +3,9 @@ services:
     image: ${CHATMOCK_IMAGE:-storagetime/chatmock:latest}
     container_name: chatmock
     command: ["serve"]
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
       - CHATGPT_LOCAL_HOME=/data
     ports:
@@ -21,6 +23,46 @@ services:
   chatmock-login:
     image: ${CHATMOCK_IMAGE:-storagetime/chatmock:latest}
     profiles: ["login"]
+    command: ["login"]
+    environment:
+      - CHATGPT_LOCAL_HOME=/data
+      - CHATGPT_LOCAL_LOGIN_BIND=0.0.0.0
+    volumes:
+      - chatmock_data:/data
+    ports:
+      - "1455:1455"
+
+  chatmock-rust:
+    profiles: ["rust"]
+    build:
+      context: .
+      dockerfile: chatmock-rs/Dockerfile
+    image: ${CHATMOCK_RUST_IMAGE:-chatmock-rust:local}
+    container_name: chatmock-rust
+    command: ["serve"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - CHATGPT_LOCAL_HOME=/data
+    ports:
+      - "8000:8000"
+    volumes:
+      - chatmock_data:/data
+      - ./prompt.md:/app/prompt.md:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  chatmock-rust-login:
+    profiles: ["rust-login"]
+    build:
+      context: .
+      dockerfile: chatmock-rs/Dockerfile
+    image: ${CHATMOCK_RUST_IMAGE:-chatmock-rust:local}
     command: ["login"]
     environment:
       - CHATGPT_LOCAL_HOME=/data
