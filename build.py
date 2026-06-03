@@ -14,6 +14,11 @@ from PIL import Image
 ROOT = Path(__file__).parent.resolve()
 BUILD_DIR = ROOT / "build"
 ICONS_DIR = BUILD_DIR / "icons"
+LEGACY_GUI_TRANSITION_STATUS = "deferred-python-pyinstaller"
+LEGACY_GUI_TRANSITION_NOTE = (
+    "Rust server remains the primary implementation target. "
+    "Python/PyInstaller GUI packaging remains the deferred legacy fallback."
+)
 
 
 def info(msg: str) -> None:
@@ -165,6 +170,9 @@ def main() -> None:
     parser.add_argument("--dmg", action="store_true")
     parser.add_argument("--dmg-only", action="store_true")
     args = parser.parse_args()
+
+    info(f"GUI transition status: {LEGACY_GUI_TRANSITION_STATUS}")
+    info(LEGACY_GUI_TRANSITION_NOTE)
 
     ensure_dirs()
     entry = ROOT / args.entry

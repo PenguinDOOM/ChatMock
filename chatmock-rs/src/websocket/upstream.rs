@@ -2,16 +2,29 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use axum::response::Response;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
+use tokio::sync::Notify;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
 use crate::{
+    auth::load_effective_chatgpt_auth_from_env_with_refresher,
     routes::json_response,
-    upstream::UpstreamResponse,
+    upstream::{
+        build_upstream_headers, refresh_chatgpt_tokens, upstream_websocket_url, UpstreamResponse,
+    },
     upstream_errors::{build_upstream_error, UpstreamErrorContext},
     websocket::registry::{
         ResponsesWebsocketSessionCapacityError, ResponsesWebsocketSessionConflictError,
@@ -43,6 +56,44 @@ impl ResponsesWebsocketConnector {
     }
 }
 
+pub fn live_responses_websocket_connector(
+    http_client: reqwest::Client,
+) -> ResponsesWebsocketConnector {
+    ResponsesWebsocketConnector::new(Arc::new(move |session_id| {
+        let http_client = http_client.clone();
+        Box::pin(async move {
+            let refresh_client = http_client.clone();
+            let effective_auth =
+                load_effective_chatgpt_auth_from_env_with_refresher(move |refresh_token| {
+                    let http_client = refresh_client.clone();
+                    async move { refresh_chatgpt_tokens(http_client, refresh_token).await }
+                })
+                .await
+                .ok_or_else(|| {
+                    std::io::Error::other(
+                        "Missing ChatGPT credentials. Run 'chatmock-rs login' first.",
+                    )
+                })?;
+
+            let mut request = upstream_websocket_url()
+                .map_err(std::io::Error::other)?
+                .into_client_request()?;
+            let headers = build_upstream_headers(
+                &effective_auth.access_token,
+                &effective_auth.account_id,
+                &session_id,
+                "application/json",
+            );
+            for (name, value) in &headers {
+                request.headers_mut().insert(name, value.clone());
+            }
+
+            let (stream, _) = connect_async(request).await?;
+            Ok(SharedUpstreamWebsocket::live(stream))
+        })
+    }))
+}
+
 impl std::fmt::Debug for ResponsesWebsocketConnector {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ResponsesWebsocketConnector(..)")
@@ -51,77 +102,185 @@ impl std::fmt::Debug for ResponsesWebsocketConnector {
 
 #[derive(Debug, Clone)]
 pub struct ScriptedUpstreamReceive {
-    text: String,
+    step: ScriptedUpstreamReceiveStep,
+}
+
+#[derive(Debug, Clone)]
+enum ScriptedUpstreamReceiveStep {
+    Text(String),
+    Wait(Arc<Notify>),
 }
 
 impl ScriptedUpstreamReceive {
     pub fn text(payload: Value) -> Self {
         Self {
-            text: serde_json::to_string(&payload).expect("scripted payload json"),
+            step: ScriptedUpstreamReceiveStep::Text(
+                serde_json::to_string(&payload).expect("scripted payload json"),
+            ),
+        }
+    }
+
+    pub fn wait(notify: Arc<Notify>) -> Self {
+        Self {
+            step: ScriptedUpstreamReceiveStep::Wait(notify),
         }
     }
 }
 
 #[derive(Debug)]
-struct SharedUpstreamWebsocketState {
-    scripted_receives: VecDeque<String>,
+struct ScriptedUpstreamWebsocketState {
+    scripted_receives: VecDeque<ScriptedUpstreamReceiveStep>,
     sent_messages: Vec<String>,
     closed: bool,
 }
 
-#[derive(Debug, Clone)]
+struct LiveUpstreamWebsocketState {
+    stream: tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>>,
+    closed: AtomicBool,
+}
+
+#[derive(Clone)]
 pub struct SharedUpstreamWebsocket {
-    state: Arc<Mutex<SharedUpstreamWebsocketState>>,
+    backend: SharedUpstreamWebsocketBackend,
+}
+
+#[derive(Clone)]
+enum SharedUpstreamWebsocketBackend {
+    Scripted(Arc<Mutex<ScriptedUpstreamWebsocketState>>),
+    Live(Arc<LiveUpstreamWebsocketState>),
+}
+
+impl std::fmt::Debug for SharedUpstreamWebsocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedUpstreamWebsocket(..)")
+    }
 }
 
 impl SharedUpstreamWebsocket {
     pub fn scripted(scripted_receives: Vec<ScriptedUpstreamReceive>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(SharedUpstreamWebsocketState {
-                scripted_receives: scripted_receives
-                    .into_iter()
-                    .map(|message| message.text)
-                    .collect(),
-                sent_messages: Vec::new(),
-                closed: false,
+            backend: SharedUpstreamWebsocketBackend::Scripted(Arc::new(Mutex::new(
+                ScriptedUpstreamWebsocketState {
+                    scripted_receives: scripted_receives
+                        .into_iter()
+                        .map(|message| message.step)
+                        .collect(),
+                    sent_messages: Vec::new(),
+                    closed: false,
+                },
+            ))),
+        }
+    }
+
+    pub fn live(stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>) -> Self {
+        Self {
+            backend: SharedUpstreamWebsocketBackend::Live(Arc::new(LiveUpstreamWebsocketState {
+                stream: tokio::sync::Mutex::new(Some(stream)),
+                closed: AtomicBool::new(false),
             })),
         }
     }
 
     pub async fn send_text(&self, message: String) -> Result<(), BoxedUpstreamWebsocketError> {
-        self.state
-            .lock()
-            .expect("scripted websocket lock")
-            .sent_messages
-            .push(message);
-        Ok(())
+        match &self.backend {
+            SharedUpstreamWebsocketBackend::Scripted(state) => {
+                state
+                    .lock()
+                    .expect("scripted websocket lock")
+                    .sent_messages
+                    .push(message);
+                Ok(())
+            }
+            SharedUpstreamWebsocketBackend::Live(state) => {
+                let mut guard = state.stream.lock().await;
+                let Some(stream) = guard.as_mut() else {
+                    state.closed.store(true, Ordering::SeqCst);
+                    return Err(std::io::Error::other("Upstream websocket is closed").into());
+                };
+                if let Err(error) = stream.send(Message::Text(message.into())).await {
+                    state.closed.store(true, Ordering::SeqCst);
+                    *guard = None;
+                    return Err(error.into());
+                }
+                Ok(())
+            }
+        }
     }
 
     pub async fn recv_text(&self) -> Result<Option<String>, BoxedUpstreamWebsocketError> {
-        Ok(self
-            .state
-            .lock()
-            .expect("scripted websocket lock")
-            .scripted_receives
-            .pop_front())
+        match &self.backend {
+            SharedUpstreamWebsocketBackend::Scripted(state) => loop {
+                let next = state
+                    .lock()
+                    .expect("scripted websocket lock")
+                    .scripted_receives
+                    .pop_front();
+                match next {
+                    Some(ScriptedUpstreamReceiveStep::Text(message)) => return Ok(Some(message)),
+                    Some(ScriptedUpstreamReceiveStep::Wait(notify)) => notify.notified().await,
+                    None => return Ok(None),
+                }
+            },
+            SharedUpstreamWebsocketBackend::Live(state) => loop {
+                let mut guard = state.stream.lock().await;
+                let Some(stream) = guard.as_mut() else {
+                    state.closed.store(true, Ordering::SeqCst);
+                    return Ok(None);
+                };
+                let frame = stream.next().await.transpose()?;
+                match frame {
+                    Some(Message::Text(text)) => return Ok(Some(text.to_string())),
+                    Some(Message::Binary(bytes)) => {
+                        return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+                    }
+                    Some(Message::Ping(payload)) => {
+                        stream.send(Message::Pong(payload)).await?;
+                    }
+                    Some(Message::Pong(_)) | Some(Message::Frame(_)) => {}
+                    Some(Message::Close(_)) | None => {
+                        state.closed.store(true, Ordering::SeqCst);
+                        *guard = None;
+                        return Ok(None);
+                    }
+                }
+            },
+        }
     }
 
     pub async fn scripted_sent_messages(&self) -> Vec<String> {
-        self.state
-            .lock()
-            .expect("scripted websocket lock")
-            .sent_messages
-            .clone()
+        match &self.backend {
+            SharedUpstreamWebsocketBackend::Scripted(state) => state
+                .lock()
+                .expect("scripted websocket lock")
+                .sent_messages
+                .clone(),
+            SharedUpstreamWebsocketBackend::Live(_) => Vec::new(),
+        }
     }
 }
 
 impl RetainedUpstreamWebsocket for SharedUpstreamWebsocket {
     fn close_socket(&self) {
-        self.state.lock().expect("scripted websocket lock").closed = true;
+        match &self.backend {
+            SharedUpstreamWebsocketBackend::Scripted(state) => {
+                state.lock().expect("scripted websocket lock").closed = true;
+            }
+            SharedUpstreamWebsocketBackend::Live(state) => {
+                state.closed.store(true, Ordering::SeqCst);
+                if let Ok(mut guard) = state.stream.try_lock() {
+                    *guard = None;
+                }
+            }
+        }
     }
 
     fn is_socket_closed(&self) -> bool {
-        self.state.lock().expect("scripted websocket lock").closed
+        match &self.backend {
+            SharedUpstreamWebsocketBackend::Scripted(state) => {
+                state.lock().expect("scripted websocket lock").closed
+            }
+            SharedUpstreamWebsocketBackend::Live(state) => state.closed.load(Ordering::SeqCst),
+        }
     }
 }
 
@@ -219,7 +378,7 @@ pub async fn send_stateful_responses_create_request(
                 retain = retained_response_id.is_some();
                 break;
             }
-            if metadata.failed {
+            if metadata.failed || metadata.errored {
                 break;
             }
         }
@@ -253,9 +412,12 @@ fn websocket_registry_error(error: BoxedUpstreamWebsocketError) -> Response {
         .downcast_ref::<ResponsesWebsocketSessionNotFoundError>()
         .is_some()
     {
+        let response_id = error
+            .downcast_ref::<ResponsesWebsocketSessionNotFoundError>()
+            .map(|not_found| not_found.response_id.as_str());
         return json_response(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({"error": {"message": error.to_string()}}),
+            StatusCode::BAD_REQUEST,
+            previous_response_not_found_payload(response_id),
         );
     }
     if error
@@ -284,6 +446,7 @@ struct WebsocketEventMetadata {
     response_id: Option<String>,
     completed: bool,
     failed: bool,
+    errored: bool,
 }
 
 fn websocket_event_metadata(message: &str) -> Option<WebsocketEventMetadata> {
@@ -299,6 +462,7 @@ fn websocket_event_metadata(message: &str) -> Option<WebsocketEventMetadata> {
         response_id,
         completed: event_type == "response.completed",
         failed: event_type == "response.failed",
+        errored: event_type == "error",
     })
 }
 
@@ -314,10 +478,25 @@ fn websocket_terminal_event(message: &str) -> bool {
         .map(|event_type| {
             matches!(
                 event_type.as_str(),
-                "response.completed" | "response.failed"
+                "response.completed" | "response.failed" | "error"
             )
         })
         .unwrap_or(false)
+}
+
+fn previous_response_not_found_payload(response_id: Option<&str>) -> Value {
+    let message = response_id
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("No response found for previous_response_id {value}."))
+        .unwrap_or_else(|| "No response found for previous_response_id.".to_string());
+    json!({
+        "code": "previous_response_not_found",
+        "message": message,
+        "error": {
+            "message": message,
+            "code": "previous_response_not_found",
+        }
+    })
 }
 
 fn websocket_request_payload(payload: Value) -> Value {

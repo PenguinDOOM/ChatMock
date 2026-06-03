@@ -11,6 +11,8 @@ use chatmock_rs::websocket::upstream::{ScriptedUpstreamReceive, SharedUpstreamWe
 use chatmock_rs::RuntimeConfig;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::Notify;
+use tokio::task::yield_now;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -97,6 +99,28 @@ async fn assert_websocket_stops(
         Some(Ok(other)) => panic!("expected websocket close, got {other:?}"),
         Some(Err(error)) => panic!("expected websocket close, got error {error}"),
     }
+}
+
+fn first_sse_event(body: &str) -> Value {
+    let event_line = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("sse event line");
+    let payload = event_line.strip_prefix("data: ").expect("sse data prefix");
+    serde_json::from_str(payload).expect("sse event json")
+}
+
+async fn wait_for_sent_messages(socket: &SharedUpstreamWebsocket, expected_len: usize) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if socket.scripted_sent_messages().await.len() >= expected_len {
+                return;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("scripted websocket should send expected messages");
 }
 
 #[test]
@@ -582,10 +606,193 @@ async fn responses_route_rejects_missing_retained_marker_in_stateful_mode() {
 
     let status = response.status();
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "previous_response_not_found");
     assert_eq!(
         body["error"]["message"],
-        "No retained upstream websocket exists for response 'resp_missing'."
+        "No response found for previous_response_id resp_missing."
     );
     assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn responses_route_streams_previous_response_not_found_for_missing_retained_marker() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![ScriptedUpstreamReceive::text(
+        json!({
+            "type": "response.completed",
+            "response": {"id": "resp_unused", "object": "response", "status": "completed", "output": []}
+        }),
+    )]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+        },
+        Arc::new(move |_session_id| {
+            let socket = scripted_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            Box::pin(async move {
+                connect_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(socket)
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", server.base_url()))
+        .header("X-Session-Id", "stateful-session")
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_missing",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("request should complete");
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .expect("content-type header")
+        .to_string();
+    let body = response.text().await.expect("stream body");
+    let event = first_sse_event(&body);
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(content_type.contains("text/event-stream"));
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["status_code"], 400);
+    assert_eq!(event["error"]["code"], "previous_response_not_found");
+    assert_eq!(
+        event["error"]["message"],
+        "No response found for previous_response_id resp_missing."
+    );
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn responses_route_rejects_same_retained_marker_while_follow_up_is_in_progress() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let release_second_turn = Arc::new(Notify::new());
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_ws_turn_1", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_turn_1", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::wait(Arc::clone(&release_second_turn)),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_ws_turn_2", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_turn_2", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+        },
+        Arc::new(move |_session_id| {
+            let socket = scripted_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            Box::pin(async move {
+                let call_index = connect_calls.fetch_add(1, Ordering::SeqCst);
+                if call_index == 0 {
+                    Ok(socket)
+                } else {
+                    Err(std::io::Error::other("unexpected second websocket connect").into())
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .header("X-Session-Id", "stateful-session")
+        .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+        .send()
+        .await
+        .expect("first request should succeed");
+
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+
+    let base_url = server.base_url().to_string();
+    let first_follow_up_client = client.clone();
+    let first_follow_up = tokio::spawn(async move {
+        first_follow_up_client
+            .post(format!("{}/v1/responses", base_url))
+            .header("X-Session-Id", "stateful-session")
+            .json(&json!({
+                "model": "gpt-5.4",
+                "input": "follow up",
+                "previous_response_id": "resp_ws_turn_1"
+            }))
+            .send()
+            .await
+    });
+
+    wait_for_sent_messages(&scripted_socket, 2).await;
+
+    let second_follow_up = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .header("X-Session-Id", "stateful-session")
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "another follow up",
+            "previous_response_id": "resp_ws_turn_1"
+        }))
+        .send()
+        .await
+        .expect("second follow-up should complete");
+
+    let second_follow_up_status = second_follow_up.status();
+    let second_follow_up_body: Value = second_follow_up
+        .json()
+        .await
+        .expect("second follow-up json body");
+    assert_eq!(second_follow_up_status, reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        second_follow_up_body["error"]["message"],
+        "A stateful HTTP websocket bridge request for response 'resp_ws_turn_1' is already in progress."
+    );
+
+    release_second_turn.notify_waiters();
+
+    let first_follow_up_response = first_follow_up
+        .await
+        .expect("first follow-up task should join")
+        .expect("first follow-up request should succeed");
+    let first_follow_up_status = first_follow_up_response.status();
+    let first_follow_up_body: Value = first_follow_up_response
+        .json()
+        .await
+        .expect("first follow-up json body");
+    assert_eq!(first_follow_up_status, reqwest::StatusCode::OK);
+    assert_eq!(first_follow_up_body["id"], "resp_ws_turn_2");
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
 }

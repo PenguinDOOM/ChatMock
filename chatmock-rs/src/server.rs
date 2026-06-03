@@ -99,9 +99,16 @@ async fn serve_with_config(
     responses_websocket_connector: Option<ResponsesWebsocketConnector>,
 ) -> Result<(), AppError> {
     let address = listener.local_addr()?;
+    let http_client = Client::new();
+    let responses_websocket_connector = responses_websocket_connector.or_else(|| {
+        config.responses_websocket_upstream.then(|| {
+            crate::websocket::upstream::live_responses_websocket_connector(http_client.clone())
+        })
+    });
     let app = app(build_app_state(
         address,
         &config,
+        http_client,
         responses_websocket_connector,
     ));
     axum::serve(listener, app).await?;
@@ -118,6 +125,7 @@ fn app(state: AppState) -> Router {
 fn build_app_state(
     bind_address: SocketAddr,
     config: &RuntimeConfig,
+    http_client: Client,
     responses_websocket_connector: Option<ResponsesWebsocketConnector>,
 ) -> AppState {
     let responses_config = default_responses_config();
@@ -135,7 +143,7 @@ fn build_app_state(
             .unwrap_or_else(|| "think-tags".to_string())
             .to_ascii_lowercase(),
         expose_reasoning_models: read_bool_env(EXPOSE_REASONING_MODELS_ENV),
-        http_client: Client::new(),
+        http_client,
         responses_websocket_connector,
         responses_websocket_registry,
     }
@@ -321,6 +329,7 @@ mod tests {
         let state = super::build_app_state(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
             &RuntimeConfig::default(),
+            reqwest::Client::new(),
             None,
         );
 

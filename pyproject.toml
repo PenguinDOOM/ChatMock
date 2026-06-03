@@ -40,3 +40,11 @@ chatmock = ["prompt.md", "prompt_gpt5_codex.md"]
 
 [tool.setuptools.dynamic]
 version = {attr = "chatmock.version.__version__"}
+
+[tool.chatmock.release_transition]
+primary_implementation = "rust"
+rust_workspace_path = "chatmock-rs"
+python_fallback_status = "explicit-legacy-python-cli"
+python_fallback_removal = "deferred"
+gui_status = "deferred-python-pyinstaller"
+release_workflow_status = "python-release-path-unchanged"

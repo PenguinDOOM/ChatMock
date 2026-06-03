@@ -1,4 +1,5 @@
 use axum::{
+    body,
     extract::{Request, State},
     http::StatusCode,
     response::Response,
@@ -16,6 +17,64 @@ use crate::{
 
 pub(crate) fn router() -> Router<crate::server::AppState> {
     Router::new().route("/v1/responses", post(responses_create))
+}
+
+fn stream_error_event_response(status: StatusCode, error: Value) -> Response {
+    let event = serde_json::json!({
+        "type": "error",
+        "status_code": status.as_u16(),
+        "error": error,
+    });
+    event_stream_response(StatusCode::OK, format!("data: {event}\n\n").into_bytes())
+}
+
+async fn into_stream_error_event_response(response: Response) -> Response {
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let error = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("error")
+                .filter(|value| value.is_object())
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "message": status
+                    .canonical_reason()
+                    .unwrap_or("Upstream websocket request failed")
+            })
+        });
+    stream_error_event_response(status, error)
+}
+
+fn sse_error_event(body: &[u8]) -> Option<(StatusCode, Value)> {
+    let mut error = None;
+    sse::for_each_sse_event(body, None, |event| {
+        if event.get("type").and_then(Value::as_str) != Some("error") {
+            return;
+        }
+
+        let status = event
+            .get("status_code")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .and_then(|value| StatusCode::from_u16(value).ok())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let body = event
+            .get("error")
+            .filter(|value| value.is_object())
+            .cloned()
+            .map(|payload| serde_json::json!({"error": payload}))
+            .unwrap_or_else(
+                || serde_json::json!({"error": {"message": "Upstream websocket error"}}),
+            );
+        error = Some((status, body));
+    });
+    error
 }
 
 async fn responses_create(
@@ -91,7 +150,12 @@ async fn responses_create(
         .await
         {
             Ok(upstream) => upstream,
-            Err(response) => return response,
+            Err(response) => {
+                if stream {
+                    return into_stream_error_event_response(response).await;
+                }
+                return response;
+            }
         }
     } else if let Some(connector) = state.responses_websocket_connector.as_ref() {
         match crate::websocket::upstream::send_responses_create_request(
@@ -102,7 +166,12 @@ async fn responses_create(
         .await
         {
             Ok(upstream) => upstream,
-            Err(response) => return response,
+            Err(response) => {
+                if stream {
+                    return into_stream_error_event_response(response).await;
+                }
+                return response;
+            }
         }
     } else {
         match upstream::start_upstream_raw_request(
@@ -159,6 +228,9 @@ async fn responses_create(
     let mut inspection = SseInspection::default();
     let (response_obj, error_obj) =
         sse::aggregate_response_from_sse(&upstream.body, Some(&mut inspection));
+    if let Some((status, error_event)) = sse_error_event(&upstream.body) {
+        return json_response(status, error_event);
+    }
     if let Some(error_obj) = error_obj {
         let is_detailed_error = error_obj
             .get("error")

@@ -8,6 +8,7 @@ use axum::{
     response::Response,
 };
 use reqwest::StatusCode;
+use reqwest::Url;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -167,11 +168,25 @@ pub(crate) async fn start_upstream_raw_request(
     })
 }
 
-fn upstream_url() -> String {
+pub(crate) fn upstream_url() -> String {
     env::var("CHATGPT_RESPONSES_URL").unwrap_or_else(|_| DEFAULT_RESPONSES_URL.to_string())
 }
 
-fn build_upstream_headers(
+pub(crate) fn upstream_websocket_url() -> Result<String, String> {
+    let mut url = Url::parse(&upstream_url()).map_err(|error| error.to_string())?;
+    match url.scheme() {
+        "https" => {
+            let _ = url.set_scheme("wss");
+        }
+        "http" => {
+            let _ = url.set_scheme("ws");
+        }
+        _ => {}
+    }
+    Ok(url.to_string())
+}
+
+pub(crate) fn build_upstream_headers(
     access_token: &str,
     account_id: &str,
     session_id: &str,
@@ -223,7 +238,7 @@ fn effective_session_id(session_id: Option<&str>, responses_payload: &Value) -> 
         .unwrap_or_else(|_| "0".to_string())
 }
 
-async fn refresh_chatgpt_tokens(
+pub(crate) async fn refresh_chatgpt_tokens(
     http_client: reqwest::Client,
     refresh_token: String,
 ) -> Option<RefreshedAuthTokens> {
