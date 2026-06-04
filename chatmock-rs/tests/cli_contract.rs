@@ -15,6 +15,10 @@ const CLI_ENV_VARS: &[&str] = &[
     "USERPROFILE",
     "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_UPSTREAM",
     "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL",
+    "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS",
+    "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS",
+    "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS",
+    "CHATGPT_LOCAL_ENABLE_CHATMOCK_JOBS",
 ];
 
 struct EnvVarGuard {
@@ -66,6 +70,13 @@ fn cli_parses_login_info_and_serve_subcommands() {
         "serve",
         "--responses-websocket-upstream",
         "--responses-websocket-upstream-stateful",
+        "--responses-websocket-retained-max-sessions",
+        "12",
+        "--responses-websocket-keep-alive-interval-ms",
+        "250",
+        "--responses-websocket-disconnect-drain-timeout-ms",
+        "1500",
+        "--enable-chatmock-jobs",
     ])
     .expect("serve cli should parse");
     assert!(matches!(
@@ -73,6 +84,10 @@ fn cli_parses_login_info_and_serve_subcommands() {
         Command::Serve(args)
             if args.responses_websocket_upstream
                 && args.responses_websocket_upstream_stateful
+                && args.responses_websocket_retained_max_sessions == Some(12)
+                && args.responses_websocket_keep_alive_interval_ms == Some(250)
+                && args.responses_websocket_disconnect_drain_timeout_ms == Some(1500)
+                && args.enable_chatmock_jobs
     ));
 }
 
@@ -88,6 +103,10 @@ fn serve_help_lists_boolean_positive_and_negative_flags() {
     assert!(help.contains("--no-responses-websocket-upstream"));
     assert!(help.contains("--responses-websocket-upstream-stateful"));
     assert!(help.contains("--no-responses-websocket-upstream-stateful"));
+    assert!(help.contains("--responses-websocket-retained-max-sessions"));
+    assert!(help.contains("--responses-websocket-keep-alive-interval-ms"));
+    assert!(help.contains("--responses-websocket-disconnect-drain-timeout-ms"));
+    assert!(help.contains("--enable-chatmock-jobs"));
 }
 
 #[test]
@@ -201,11 +220,28 @@ fn runtime_config_uses_env_fallback_for_websocket_flags() {
         "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL",
         "true",
     );
+    std::env::set_var(
+        "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS",
+        "7",
+    );
+    std::env::set_var(
+        "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS",
+        "125",
+    );
+    std::env::set_var(
+        "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS",
+        "750",
+    );
+    std::env::set_var("CHATGPT_LOCAL_ENABLE_CHATMOCK_JOBS", "true");
 
     let config = RuntimeConfig::from_sources(ServeArgs::default()).expect("config from env");
 
     assert!(config.responses_websocket_upstream);
     assert!(config.responses_websocket_upstream_stateful);
+    assert_eq!(config.responses_websocket_retained_max_sessions, 7);
+    assert_eq!(config.responses_websocket_keep_alive_interval_ms, 125);
+    assert_eq!(config.responses_websocket_disconnect_drain_timeout_ms, 750);
+    assert!(config.enable_chatmock_jobs);
 }
 
 #[test]

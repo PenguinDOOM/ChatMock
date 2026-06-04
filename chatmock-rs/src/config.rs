@@ -12,6 +12,16 @@ const PORT_ENV: &str = "CHATMOCK_PORT";
 const RESPONSES_WEBSOCKET_UPSTREAM_ENV: &str = "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_UPSTREAM";
 const RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL_ENV: &str =
     "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL";
+const RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS_ENV: &str =
+    "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS";
+const RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS_ENV: &str =
+    "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS";
+const RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS_ENV: &str =
+    "CHATGPT_LOCAL_RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS";
+const ENABLE_CHATMOCK_JOBS_ENV: &str = "CHATGPT_LOCAL_ENABLE_CHATMOCK_JOBS";
+const DEFAULT_RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS: usize = 64;
+const DEFAULT_RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS: u64 = 1000;
+const DEFAULT_RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "chatmock-rs")]
@@ -69,6 +79,18 @@ pub struct ServeArgs {
         conflicts_with = "responses_websocket_upstream_stateful"
     )]
     pub no_responses_websocket_upstream_stateful: bool,
+
+    #[arg(long)]
+    pub responses_websocket_retained_max_sessions: Option<usize>,
+
+    #[arg(long)]
+    pub responses_websocket_keep_alive_interval_ms: Option<u64>,
+
+    #[arg(long)]
+    pub responses_websocket_disconnect_drain_timeout_ms: Option<u64>,
+
+    #[arg(long, default_value_t = false)]
+    pub enable_chatmock_jobs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +99,10 @@ pub struct RuntimeConfig {
     pub port: u16,
     pub responses_websocket_upstream: bool,
     pub responses_websocket_upstream_stateful: bool,
+    pub responses_websocket_retained_max_sessions: usize,
+    pub responses_websocket_keep_alive_interval_ms: u64,
+    pub responses_websocket_disconnect_drain_timeout_ms: u64,
+    pub enable_chatmock_jobs: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -86,6 +112,13 @@ impl Default for RuntimeConfig {
             port: DEFAULT_PORT,
             responses_websocket_upstream: false,
             responses_websocket_upstream_stateful: false,
+            responses_websocket_retained_max_sessions:
+                DEFAULT_RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS,
+            responses_websocket_keep_alive_interval_ms:
+                DEFAULT_RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS,
+            responses_websocket_disconnect_drain_timeout_ms:
+                DEFAULT_RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS,
+            enable_chatmock_jobs: false,
         }
     }
 }
@@ -110,12 +143,48 @@ impl RuntimeConfig {
             args.no_responses_websocket_upstream_stateful,
             RESPONSES_WEBSOCKET_UPSTREAM_STATEFUL_ENV,
         )?;
+        let responses_websocket_retained_max_sessions = args
+            .responses_websocket_retained_max_sessions
+            .map(Ok)
+            .unwrap_or_else(|| {
+                read_usize_env(
+                    RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS_ENV,
+                    DEFAULT_RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS,
+                )
+            })?;
+        let responses_websocket_keep_alive_interval_ms = args
+            .responses_websocket_keep_alive_interval_ms
+            .map(Ok)
+            .unwrap_or_else(|| {
+                read_u64_env(
+                    RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS_ENV,
+                    DEFAULT_RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS,
+                )
+            })?;
+        let responses_websocket_disconnect_drain_timeout_ms = args
+            .responses_websocket_disconnect_drain_timeout_ms
+            .map(Ok)
+            .unwrap_or_else(|| {
+                read_u64_env(
+                    RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS_ENV,
+                    DEFAULT_RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS,
+                )
+            })?;
+        let enable_chatmock_jobs = if args.enable_chatmock_jobs {
+            true
+        } else {
+            read_bool_env(ENABLE_CHATMOCK_JOBS_ENV)?
+        };
 
         let config = Self {
             host,
             port,
             responses_websocket_upstream,
             responses_websocket_upstream_stateful,
+            responses_websocket_retained_max_sessions,
+            responses_websocket_keep_alive_interval_ms,
+            responses_websocket_disconnect_drain_timeout_ms,
+            enable_chatmock_jobs,
         };
 
         config.validate()?;
@@ -133,6 +202,24 @@ impl RuntimeConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.responses_websocket_upstream_stateful && !self.responses_websocket_upstream {
             return Err(ConfigError::StatefulRequiresWebsocketUpstream);
+        }
+        if self.responses_websocket_retained_max_sessions == 0 {
+            return Err(ConfigError::InvalidEnvVar {
+                name: RESPONSES_WEBSOCKET_RETAINED_MAX_SESSIONS_ENV,
+                value: "0".to_string(),
+            });
+        }
+        if self.responses_websocket_keep_alive_interval_ms == 0 {
+            return Err(ConfigError::InvalidEnvVar {
+                name: RESPONSES_WEBSOCKET_KEEP_ALIVE_INTERVAL_MS_ENV,
+                value: "0".to_string(),
+            });
+        }
+        if self.responses_websocket_disconnect_drain_timeout_ms == 0 {
+            return Err(ConfigError::InvalidEnvVar {
+                name: RESPONSES_WEBSOCKET_DISCONNECT_DRAIN_TIMEOUT_MS_ENV,
+                value: "0".to_string(),
+            });
         }
 
         Ok(())
@@ -162,6 +249,30 @@ fn read_port_env(name: &'static str) -> Result<Option<u16>, ConfigError> {
                 .map_err(|_| ConfigError::InvalidEnvVar { name, value })
         })
         .transpose()
+}
+
+fn read_usize_env(name: &'static str, default: usize) -> Result<usize, ConfigError> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| ConfigError::InvalidEnvVar { name, value })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn read_u64_env(name: &'static str, default: u64) -> Result<u64, ConfigError> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidEnvVar { name, value })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 fn read_bool_env(name: &'static str) -> Result<bool, ConfigError> {

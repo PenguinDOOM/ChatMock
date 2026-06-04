@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use axum::{
     body::Body,
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
@@ -10,6 +12,7 @@ use crate::protocol::ResponsesConfig;
 
 pub mod chat_completions;
 pub mod completions;
+pub mod jobs;
 pub mod models;
 pub mod responses;
 
@@ -41,6 +44,23 @@ pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> 
 
 pub(crate) fn event_stream_response(status: StatusCode, body: Vec<u8>) -> Response<Body> {
     let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    apply_cors(headers);
+    response
+}
+
+pub(crate) fn event_streaming_response<S>(status: StatusCode, stream: S) -> Response<Body>
+where
+    S: futures_util::Stream<Item = Result<Vec<u8>, Infallible>> + Send + 'static,
+{
+    let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(

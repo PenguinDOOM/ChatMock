@@ -7,7 +7,9 @@ use chatmock_rs::websocket::registry::{
     ResponsesWebsocketSessionNotFoundError, RetainedUpstreamWebsocket,
     RetainedUpstreamWebsocketRegistry,
 };
-use chatmock_rs::websocket::upstream::{ScriptedUpstreamReceive, SharedUpstreamWebsocket};
+use chatmock_rs::websocket::upstream::{
+    ResponsesWebsocketConnectContext, ScriptedUpstreamReceive, SharedUpstreamWebsocket,
+};
 use chatmock_rs::RuntimeConfig;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -153,6 +155,61 @@ fn registry_promotes_first_turn_to_response_marker_and_reuses_it() {
 }
 
 #[test]
+fn registry_initial_lease_has_codex_style_metadata_and_reuses_it() {
+    let registry = RetainedUpstreamWebsocketRegistry::new(2);
+    let first = registry
+        .acquire(None, || Ok(make_socket()))
+        .expect("first lease");
+
+    assert!(first.created);
+    assert_eq!(first.metadata.session_id, first.metadata.thread_id);
+    assert_eq!(first.metadata.window_generation, 1);
+    assert_eq!(first.metadata.last_response_id, None);
+    assert_eq!(first.metadata.turn_state, None);
+
+    let first_session_id = first.metadata.session_id.clone();
+    let first_thread_id = first.metadata.thread_id.clone();
+    registry.release(first, true, Some("resp_fixed_1"));
+
+    let second = registry
+        .acquire(Some("resp_fixed_1"), || Ok(make_socket()))
+        .expect("second lease");
+
+    assert!(!second.created);
+    assert_eq!(second.metadata.session_id, first_session_id);
+    assert_eq!(second.metadata.thread_id, first_thread_id);
+    assert_eq!(second.metadata.window_generation, 1);
+    assert_eq!(
+        second.metadata.last_response_id.as_deref(),
+        Some("resp_fixed_1")
+    );
+
+    registry.release(second, true, Some("resp_fixed_2"));
+}
+
+#[test]
+fn registry_guard_can_store_upgrade_turn_state_without_changing_marker() {
+    let registry = Arc::new(RetainedUpstreamWebsocketRegistry::new(2));
+    let first = registry
+        .acquire(None, || Ok(make_socket()))
+        .expect("first lease");
+    let mut guard = chatmock_rs::websocket::registry::RetainedUpstreamWebsocketLeaseGuard::new(
+        Arc::clone(&registry),
+        first,
+    );
+    guard.set_turn_state(Some("turn-state-1".to_string()));
+    guard.mark_completed("resp_fixed_1");
+    guard.release();
+
+    let second = registry
+        .acquire(Some("resp_fixed_1"), || Ok(make_socket()))
+        .expect("second lease");
+    assert_eq!(second.metadata.turn_state.as_deref(), Some("turn-state-1"));
+
+    registry.release(second, true, Some("resp_fixed_2"));
+}
+
+#[test]
 fn registry_rejects_same_marker_contention() {
     let registry = RetainedUpstreamWebsocketRegistry::new(2);
     let first = registry
@@ -273,6 +330,85 @@ async fn responses_route_uses_websocket_bridge_when_enabled() {
     assert_eq!(outbound["model"], "gpt-5.4");
     assert_eq!(outbound["stream"], true);
     assert!(outbound.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn responses_route_intercepts_chatmock_job_tool_calls() {
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_tool_turn", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "chatmock_poll_job",
+                "call_id": "call_chatmock_poll",
+                "arguments": "{\"job_id\":\"job_missing\",\"max_wait_ms\":60000}"
+            }
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_after_tool", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_after_tool", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            enable_chatmock_jobs: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            Box::pin(async move { Ok(socket) })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({"model": "gpt-5.4", "input": "start a long job"}))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["id"], "resp_after_tool");
+
+    let sent_messages = scripted_socket.scripted_sent_messages().await;
+    assert_eq!(sent_messages.len(), 2);
+    let first_outbound: Value = serde_json::from_str(&sent_messages[0]).expect("first outbound");
+    assert!(first_outbound["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .any(|tool| tool["name"] == "chatmock_start_job"));
+    assert!(first_outbound["instructions"]
+        .as_str()
+        .expect("instructions")
+        .contains("chatmock_start_job"));
+
+    let follow_up: Value = serde_json::from_str(&sent_messages[1]).expect("follow-up outbound");
+    assert_eq!(follow_up["type"], "response.create");
+    assert_eq!(follow_up["previous_response_id"], "resp_tool_turn");
+    assert_eq!(follow_up["input"][0]["type"], "function_call_output");
+    assert_eq!(follow_up["input"][0]["call_id"], "call_chatmock_poll");
+    assert!(follow_up["input"][0]["output"]
+        .as_str()
+        .expect("tool output")
+        .contains("Job not found"));
 }
 
 #[tokio::test]
@@ -477,6 +613,7 @@ async fn responses_websocket_route_relays_upstream_messages() {
 #[tokio::test]
 async fn responses_route_reuses_retained_websocket_for_previous_response_id() {
     let connect_calls = Arc::new(AtomicUsize::new(0));
+    let connect_contexts = Arc::new(Mutex::new(Vec::<ResponsesWebsocketConnectContext>::new()));
     let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
         ScriptedUpstreamReceive::text(json!({
             "type": "response.created",
@@ -497,6 +634,7 @@ async fn responses_route_reuses_retained_websocket_for_previous_response_id() {
     ]);
     let scripted_socket_for_connector = scripted_socket.clone();
     let connect_calls_for_connector = Arc::clone(&connect_calls);
+    let connect_contexts_for_connector = Arc::clone(&connect_contexts);
 
     let server = server::spawn_server_with_websocket_connector(
         RuntimeConfig {
@@ -504,11 +642,17 @@ async fn responses_route_reuses_retained_websocket_for_previous_response_id() {
             port: 0,
             responses_websocket_upstream: true,
             responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
         },
-        Arc::new(move |_session_id| {
+        Arc::new(move |context| {
             let socket = scripted_socket_for_connector.clone();
             let connect_calls = Arc::clone(&connect_calls_for_connector);
+            let connect_contexts = Arc::clone(&connect_contexts_for_connector);
             Box::pin(async move {
+                connect_contexts
+                    .lock()
+                    .expect("lock contexts")
+                    .push(context);
                 let call_index = connect_calls.fetch_add(1, Ordering::SeqCst);
                 if call_index == 0 {
                     Ok(socket)
@@ -552,6 +696,13 @@ async fn responses_route_reuses_retained_websocket_for_previous_response_id() {
     assert_eq!(second_status, reqwest::StatusCode::OK);
     assert_eq!(second_body["id"], "resp_ws_turn_2");
     assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+    {
+        let contexts = connect_contexts.lock().expect("lock contexts");
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].session_id, contexts[0].thread_id);
+        assert_eq!(contexts[0].window_generation, 1);
+        assert_eq!(contexts[0].turn_state, None);
+    }
 
     let sent_messages = scripted_socket.scripted_sent_messages().await;
     assert_eq!(sent_messages.len(), 2);
@@ -579,6 +730,7 @@ async fn responses_route_rejects_missing_retained_marker_in_stateful_mode() {
             port: 0,
             responses_websocket_upstream: true,
             responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
         },
         Arc::new(move |_session_id| {
             let socket = scripted_socket_for_connector.clone();
@@ -633,6 +785,7 @@ async fn responses_route_streams_previous_response_not_found_for_missing_retaine
             port: 0,
             responses_websocket_upstream: true,
             responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
         },
         Arc::new(move |_session_id| {
             let socket = scripted_socket_for_connector.clone();
@@ -713,6 +866,7 @@ async fn responses_route_rejects_same_retained_marker_while_follow_up_is_in_prog
             port: 0,
             responses_websocket_upstream: true,
             responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
         },
         Arc::new(move |_session_id| {
             let socket = scripted_socket_for_connector.clone();
@@ -795,4 +949,270 @@ async fn responses_route_rejects_same_retained_marker_while_follow_up_is_in_prog
     assert_eq!(first_follow_up_status, reqwest::StatusCode::OK);
     assert_eq!(first_follow_up_body["id"], "resp_ws_turn_2");
     assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_route_stateful_stream_yields_first_chunk_before_completion() {
+    let release_completion = Arc::new(Notify::new());
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_streaming", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::wait(Arc::clone(&release_completion)),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_streaming", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            Box::pin(async move { Ok(socket) })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let mut response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let first_chunk = timeout(Duration::from_secs(1), response.chunk())
+        .await
+        .expect("first chunk before completion")
+        .expect("first chunk result")
+        .expect("first chunk bytes");
+    let first_chunk = String::from_utf8(first_chunk.to_vec()).expect("utf8 chunk");
+    assert!(first_chunk.contains("\"type\":\"response.created\""));
+
+    release_completion.notify_waiters();
+    let rest = timeout(Duration::from_secs(1), response.chunk())
+        .await
+        .expect("completed chunk")
+        .expect("completed chunk result")
+        .expect("completed chunk bytes");
+    assert!(String::from_utf8(rest.to_vec())
+        .expect("utf8 completed")
+        .contains("\"type\":\"response.completed\""));
+}
+
+#[tokio::test]
+async fn responses_route_stateful_stream_sends_comment_keep_alive() {
+    let release_first_event = Arc::new(Notify::new());
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::wait(Arc::clone(&release_first_event)),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_keepalive", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            Box::pin(async move { Ok(socket) })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let mut response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("request should complete");
+
+    let keep_alive = timeout(Duration::from_secs(2), response.chunk())
+        .await
+        .expect("keep-alive chunk")
+        .expect("keep-alive result")
+        .expect("keep-alive bytes");
+    assert_eq!(keep_alive.as_ref(), b": keep-alive\n\n");
+
+    release_first_event.notify_waiters();
+}
+
+#[tokio::test]
+async fn responses_route_stateful_stream_drains_after_client_disconnect_to_completed() {
+    let release_completion = Arc::new(Notify::new());
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_drain_1", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::wait(Arc::clone(&release_completion)),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_drain_1", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_drain_2", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_drain_2", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            responses_websocket_disconnect_drain_timeout_ms: 1_000,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            Box::pin(async move { Ok(socket) })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let mut first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("first request should complete");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+
+    let first_chunk = timeout(Duration::from_secs(1), first_response.chunk())
+        .await
+        .expect("first chunk")
+        .expect("first chunk result")
+        .expect("first chunk bytes");
+    assert!(String::from_utf8(first_chunk.to_vec())
+        .expect("utf8 first")
+        .contains("\"type\":\"response.created\""));
+    drop(first_response);
+
+    release_completion.notify_waiters();
+
+    let second_response = timeout(Duration::from_secs(2), async {
+        loop {
+            let response = client
+                .post(format!("{}/v1/responses", server.base_url()))
+                .json(&json!({
+                    "model": "gpt-5.4",
+                    "input": "follow up",
+                    "previous_response_id": "resp_drain_1"
+                }))
+                .send()
+                .await
+                .expect("follow-up request should complete");
+            if response.status() == reqwest::StatusCode::OK {
+                return response;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("drain should retain completed response");
+
+    let second_body: Value = second_response.json().await.expect("second body");
+    assert_eq!(second_body["id"], "resp_drain_2");
+}
+
+#[tokio::test]
+async fn responses_route_stateful_stream_disconnect_drain_timeout_does_not_retain() {
+    let never_complete = Arc::new(Notify::new());
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_timeout_1", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::wait(Arc::clone(&never_complete)),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            responses_websocket_disconnect_drain_timeout_ms: 50,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            Box::pin(async move { Ok(socket) })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let mut first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("first request should complete");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let _ = timeout(Duration::from_secs(1), first_response.chunk())
+        .await
+        .expect("first chunk")
+        .expect("first chunk result")
+        .expect("first chunk bytes");
+    drop(first_response);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_timeout_1"
+        }))
+        .send()
+        .await
+        .expect("follow-up should complete");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 }

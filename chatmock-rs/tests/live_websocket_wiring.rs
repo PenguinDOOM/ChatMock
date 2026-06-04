@@ -12,9 +12,17 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        handshake::server::{Request as WebsocketRequest, Response as WebsocketResponse},
+        http::HeaderValue,
+        Message,
+    },
+};
 
 const TEST_ENV_VARS: &[&str] = &["CHATGPT_LOCAL_HOME", "CHATGPT_RESPONSES_URL"];
+type CapturedUpgradeHeaders = Arc<Mutex<Vec<Vec<(String, String)>>>>;
 
 struct EnvVarGuard {
     saved: Vec<(&'static str, Option<OsString>)>,
@@ -50,25 +58,55 @@ fn env_lock() -> &'static tokio::sync::Mutex<()> {
 struct FakeUpstreamServer {
     base_http_url: String,
     connect_calls: Arc<AtomicUsize>,
+    upgrade_headers: CapturedUpgradeHeaders,
     received_messages: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
 }
 
 impl FakeUpstreamServer {
+    #[allow(clippy::result_large_err)]
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake upstream");
         let address = listener.local_addr().expect("fake upstream addr");
         let connect_calls = Arc::new(AtomicUsize::new(0));
+        let upgrade_headers = Arc::new(Mutex::new(Vec::new()));
         let received_messages = Arc::new(Mutex::new(Vec::new()));
         let connect_calls_for_task = Arc::clone(&connect_calls);
+        let upgrade_headers_for_task = Arc::clone(&upgrade_headers);
         let received_messages_for_task = Arc::clone(&received_messages);
 
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept upstream socket");
             connect_calls_for_task.fetch_add(1, Ordering::SeqCst);
-            let mut websocket = accept_async(stream).await.expect("accept websocket");
+            let mut websocket = accept_hdr_async(
+                stream,
+                move |request: &WebsocketRequest, mut response: WebsocketResponse| {
+                    upgrade_headers_for_task
+                        .lock()
+                        .expect("lock upgrade headers")
+                        .push(
+                            request
+                                .headers()
+                                .iter()
+                                .filter_map(|(name, value)| {
+                                    value
+                                        .to_str()
+                                        .ok()
+                                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                                })
+                                .collect(),
+                        );
+                    response.headers_mut().insert(
+                        "x-codex-turn-state",
+                        HeaderValue::from_static("stored-turn-state"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("accept websocket");
 
             let first_message = next_text_frame(&mut websocket).await;
             received_messages_for_task
@@ -148,6 +186,7 @@ impl FakeUpstreamServer {
         Self {
             base_http_url: format!("http://{address}"),
             connect_calls,
+            upgrade_headers,
             received_messages,
             task,
         }
@@ -219,6 +258,7 @@ async fn spawn_server_live_path_reuses_real_websocket_connector_for_stateful_fol
         port: 0,
         responses_websocket_upstream: true,
         responses_websocket_upstream_stateful: true,
+        ..RuntimeConfig::default()
     })
     .await
     .expect("server should start");
@@ -253,10 +293,33 @@ async fn spawn_server_live_path_reuses_real_websocket_connector_for_stateful_fol
     assert_eq!(second_body["id"], "resp_live_turn_2");
 
     let connect_calls = Arc::clone(&fake_upstream.connect_calls);
+    let upgrade_headers = Arc::clone(&fake_upstream.upgrade_headers);
     drop(server);
 
     let received_messages = fake_upstream.finish().await;
     assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+    let upgrade_headers = upgrade_headers
+        .lock()
+        .expect("lock upgrade headers")
+        .clone();
+    assert_eq!(upgrade_headers.len(), 1);
+    let headers = &upgrade_headers[0];
+    assert!(headers
+        .iter()
+        .any(|(name, value)| name == "session_id" && !value.is_empty()));
+    assert!(headers
+        .iter()
+        .any(|(name, value)| name == "session-id" && !value.is_empty()));
+    assert!(headers
+        .iter()
+        .any(|(name, value)| name == "thread-id" && !value.is_empty()));
+    assert!(headers
+        .iter()
+        .any(|(name, value)| name == "x-codex-window-id" && value.ends_with(":1")));
+    assert!(headers.iter().any(|(name, value)| {
+        name == "openai-beta" && value == "responses_websockets=2026-02-06"
+    }));
+    assert!(!headers.iter().any(|(name, _)| name == "x-codex-turn-state"));
     assert_eq!(received_messages.len(), 2);
 
     let first_outbound: Value =

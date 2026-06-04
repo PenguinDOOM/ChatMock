@@ -133,6 +133,10 @@ async fn responses_create(
     if state.responses_websocket_registry.is_none() {
         upstream_payload.remove("previous_response_id");
     }
+    if state.chatmock_jobs_enabled {
+        crate::jobs::inject_chatmock_job_tools(&mut upstream_payload);
+        crate::jobs::inject_chatmock_job_instructions(&mut upstream_payload);
+    }
     upstream_payload.insert("stream".to_string(), Value::Bool(true));
     let upstream_payload = Value::Object(upstream_payload);
 
@@ -140,12 +144,33 @@ async fn responses_create(
         state.responses_websocket_connector.as_ref(),
         state.responses_websocket_registry.as_ref(),
     ) {
+        if stream {
+            match crate::websocket::upstream::send_stateful_responses_create_stream(
+                connector,
+                std::sync::Arc::clone(registry),
+                &normalized.session_id,
+                upstream_payload.clone(),
+                previous_response_id.as_deref(),
+                state.responses_websocket_stream_config,
+                state.chatmock_jobs_enabled.then_some(std::sync::Arc::clone(
+                    &state.job_manager,
+                )),
+            )
+            .await
+            {
+                Ok(response) => return response,
+                Err(response) => return into_stream_error_event_response(response).await,
+            }
+        }
         match crate::websocket::upstream::send_stateful_responses_create_request(
             connector,
-            registry,
+            std::sync::Arc::clone(registry),
             &normalized.session_id,
             upstream_payload.clone(),
             previous_response_id.as_deref(),
+            state.chatmock_jobs_enabled.then_some(std::sync::Arc::clone(
+                &state.job_manager,
+            )),
         )
         .await
         {
@@ -162,6 +187,9 @@ async fn responses_create(
             connector,
             &normalized.session_id,
             upstream_payload.clone(),
+            state.chatmock_jobs_enabled.then_some(std::sync::Arc::clone(
+                &state.job_manager,
+            )),
         )
         .await
         {

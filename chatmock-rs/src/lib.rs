@@ -4,6 +4,7 @@ pub mod config;
 pub mod errors;
 pub mod fast_mode;
 pub mod info;
+pub mod jobs;
 pub mod login;
 pub mod models;
 pub mod prompts;

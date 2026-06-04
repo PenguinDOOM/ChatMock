@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use reqwest::Client;
@@ -9,10 +9,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::{
     config::RuntimeConfig,
     errors::AppError,
+    jobs::{JobManager, JobManagerConfig},
     prompts::{read_prompt_text, PromptLookup},
     protocol::ResponsesConfig,
     websocket::registry::RetainedUpstreamWebsocketRegistry,
-    websocket::upstream::{ResponsesWebsocketConnector, ResponsesWebsocketConnectorFn},
+    websocket::upstream::{
+        ResponsesWebsocketConnector, ResponsesWebsocketConnectorFn,
+        StatefulResponsesWebsocketStreamConfig,
+    },
 };
 
 const DEBUG_MODEL_ENV: &str = "CHATGPT_LOCAL_DEBUG_MODEL";
@@ -34,6 +38,9 @@ pub(crate) struct AppState {
     pub(crate) responses_websocket_registry: Option<
         Arc<RetainedUpstreamWebsocketRegistry<crate::websocket::upstream::SharedUpstreamWebsocket>>,
     >,
+    pub(crate) responses_websocket_stream_config: StatefulResponsesWebsocketStreamConfig,
+    pub(crate) chatmock_jobs_enabled: bool,
+    pub(crate) job_manager: Arc<JobManager>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -53,6 +60,12 @@ impl std::fmt::Debug for AppState {
                 "responses_websocket_registry",
                 &self.responses_websocket_registry,
             )
+            .field(
+                "responses_websocket_stream_config",
+                &self.responses_websocket_stream_config,
+            )
+            .field("chatmock_jobs_enabled", &self.chatmock_jobs_enabled)
+            .field("job_manager", &self.job_manager)
             .finish()
     }
 }
@@ -118,6 +131,7 @@ async fn serve_with_config(
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .merge(crate::routes::jobs::router())
         .merge(crate::routes::openai_router())
         .with_state(state)
 }
@@ -132,9 +146,19 @@ fn build_app_state(
     let responses_websocket_registry = if config.responses_websocket_upstream_stateful
         && responses_websocket_connector.is_some()
     {
-        Some(Arc::new(RetainedUpstreamWebsocketRegistry::new(64)))
+        Some(Arc::new(RetainedUpstreamWebsocketRegistry::new(
+            config.responses_websocket_retained_max_sessions,
+        )))
     } else {
         None
+    };
+    let responses_websocket_stream_config = StatefulResponsesWebsocketStreamConfig {
+        keep_alive_interval: Duration::from_millis(
+            config.responses_websocket_keep_alive_interval_ms,
+        ),
+        disconnect_drain_timeout: Duration::from_millis(
+            config.responses_websocket_disconnect_drain_timeout_ms,
+        ),
     };
     AppState {
         bind_address,
@@ -146,6 +170,9 @@ fn build_app_state(
         http_client,
         responses_websocket_connector,
         responses_websocket_registry,
+        responses_websocket_stream_config,
+        chatmock_jobs_enabled: config.enable_chatmock_jobs,
+        job_manager: Arc::new(JobManager::new(JobManagerConfig::default())),
     }
 }
 

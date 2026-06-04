@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    convert::Infallible,
     future::Future,
     pin::Pin,
     sync::{
@@ -8,11 +9,12 @@ use std::{
     },
 };
 
-use axum::response::Response;
-use futures_util::{SinkExt, StreamExt};
+use axum::{body::Body, response::Response};
+use futures_util::{stream::BoxStream, SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
+use tokio::time::{interval, timeout, Duration, Instant};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message},
@@ -21,15 +23,17 @@ use tokio_tungstenite::{
 
 use crate::{
     auth::load_effective_chatgpt_auth_from_env_with_refresher,
+    jobs::JobManager,
     routes::json_response,
     upstream::{
-        build_upstream_headers, refresh_chatgpt_tokens, upstream_websocket_url, UpstreamResponse,
+        build_upstream_websocket_headers, refresh_chatgpt_tokens, upstream_websocket_url,
+        UpstreamResponse,
     },
     upstream_errors::{build_upstream_error, UpstreamErrorContext},
     websocket::registry::{
         ResponsesWebsocketSessionCapacityError, ResponsesWebsocketSessionConflictError,
         ResponsesWebsocketSessionNotFoundError, RetainedUpstreamWebsocket,
-        RetainedUpstreamWebsocketRegistry,
+        RetainedUpstreamWebsocketLeaseGuard, RetainedUpstreamWebsocketRegistry,
     },
 };
 
@@ -38,7 +42,45 @@ pub type ResponsesWebsocketConnectFuture = Pin<
     Box<dyn Future<Output = Result<SharedUpstreamWebsocket, BoxedUpstreamWebsocketError>> + Send>,
 >;
 pub type ResponsesWebsocketConnectorFn =
-    dyn Fn(String) -> ResponsesWebsocketConnectFuture + Send + Sync;
+    dyn Fn(ResponsesWebsocketConnectContext) -> ResponsesWebsocketConnectFuture + Send + Sync;
+
+const STATEFUL_SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
+const STATEFUL_SSE_DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy)]
+pub struct StatefulResponsesWebsocketStreamConfig {
+    pub keep_alive_interval: Duration,
+    pub disconnect_drain_timeout: Duration,
+}
+
+impl Default for StatefulResponsesWebsocketStreamConfig {
+    fn default() -> Self {
+        Self {
+            keep_alive_interval: STATEFUL_SSE_KEEP_ALIVE_INTERVAL,
+            disconnect_drain_timeout: STATEFUL_SSE_DISCONNECT_DRAIN_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsesWebsocketConnectContext {
+    pub session_id: String,
+    pub thread_id: String,
+    pub window_generation: u64,
+    pub turn_state: Option<String>,
+}
+
+impl ResponsesWebsocketConnectContext {
+    pub fn compatibility(session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        Self {
+            thread_id: session_id.clone(),
+            session_id,
+            window_generation: 1,
+            turn_state: None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ResponsesWebsocketConnector(Arc<ResponsesWebsocketConnectorFn>);
@@ -50,16 +92,16 @@ impl ResponsesWebsocketConnector {
 
     pub async fn connect(
         &self,
-        session_id: String,
+        context: ResponsesWebsocketConnectContext,
     ) -> Result<SharedUpstreamWebsocket, BoxedUpstreamWebsocketError> {
-        (self.0)(session_id).await
+        (self.0)(context).await
     }
 }
 
 pub fn live_responses_websocket_connector(
     http_client: reqwest::Client,
 ) -> ResponsesWebsocketConnector {
-    ResponsesWebsocketConnector::new(Arc::new(move |session_id| {
+    ResponsesWebsocketConnector::new(Arc::new(move |context| {
         let http_client = http_client.clone();
         Box::pin(async move {
             let refresh_client = http_client.clone();
@@ -78,18 +120,26 @@ pub fn live_responses_websocket_connector(
             let mut request = upstream_websocket_url()
                 .map_err(std::io::Error::other)?
                 .into_client_request()?;
-            let headers = build_upstream_headers(
+            let headers = build_upstream_websocket_headers(
                 &effective_auth.access_token,
                 &effective_auth.account_id,
-                &session_id,
-                "application/json",
+                &context.session_id,
+                &context.thread_id,
+                context.window_generation,
+                context.turn_state.as_deref(),
             );
             for (name, value) in &headers {
                 request.headers_mut().insert(name, value.clone());
             }
 
-            let (stream, _) = connect_async(request).await?;
-            Ok(SharedUpstreamWebsocket::live(stream))
+            let (stream, response) = connect_async(request).await?;
+            let turn_state = response
+                .headers()
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .filter(|value| !value.trim().is_empty());
+            Ok(SharedUpstreamWebsocket::live(stream, turn_state))
         })
     }))
 }
@@ -131,11 +181,13 @@ impl ScriptedUpstreamReceive {
 struct ScriptedUpstreamWebsocketState {
     scripted_receives: VecDeque<ScriptedUpstreamReceiveStep>,
     sent_messages: Vec<String>,
+    turn_state: Option<String>,
     closed: bool,
 }
 
 struct LiveUpstreamWebsocketState {
     stream: tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>>,
+    turn_state: Option<String>,
     closed: AtomicBool,
 }
 
@@ -166,16 +218,32 @@ impl SharedUpstreamWebsocket {
                         .map(|message| message.step)
                         .collect(),
                     sent_messages: Vec::new(),
+                    turn_state: None,
                     closed: false,
                 },
             ))),
         }
     }
 
-    pub fn live(stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>) -> Self {
+    pub fn scripted_with_turn_state(
+        scripted_receives: Vec<ScriptedUpstreamReceive>,
+        turn_state: impl Into<String>,
+    ) -> Self {
+        let socket = Self::scripted(scripted_receives);
+        if let SharedUpstreamWebsocketBackend::Scripted(state) = &socket.backend {
+            state.lock().expect("scripted websocket lock").turn_state = Some(turn_state.into());
+        }
+        socket
+    }
+
+    pub fn live(
+        stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        turn_state: Option<String>,
+    ) -> Self {
         Self {
             backend: SharedUpstreamWebsocketBackend::Live(Arc::new(LiveUpstreamWebsocketState {
                 stream: tokio::sync::Mutex::new(Some(stream)),
+                turn_state,
                 closed: AtomicBool::new(false),
             })),
         }
@@ -257,6 +325,17 @@ impl SharedUpstreamWebsocket {
             SharedUpstreamWebsocketBackend::Live(_) => Vec::new(),
         }
     }
+
+    pub fn upgrade_turn_state(&self) -> Option<String> {
+        match &self.backend {
+            SharedUpstreamWebsocketBackend::Scripted(state) => state
+                .lock()
+                .expect("scripted websocket lock")
+                .turn_state
+                .clone(),
+            SharedUpstreamWebsocketBackend::Live(state) => state.turn_state.clone(),
+        }
+    }
 }
 
 impl RetainedUpstreamWebsocket for SharedUpstreamWebsocket {
@@ -288,9 +367,10 @@ pub async fn send_responses_create_request(
     connector: &ResponsesWebsocketConnector,
     session_id: &str,
     payload: Value,
+    job_manager: Option<Arc<JobManager>>,
 ) -> Result<UpstreamResponse, Response> {
     let socket = connector
-        .connect(session_id.to_string())
+        .connect(ResponsesWebsocketConnectContext::compatibility(session_id))
         .await
         .map_err(|error| websocket_gateway_error("Upstream websocket connection failed", error))?;
 
@@ -302,11 +382,25 @@ pub async fn send_responses_create_request(
         .map_err(|error| websocket_gateway_error("Upstream websocket request failed", error))?;
 
     let mut body = String::new();
+    let mut current_response_id = None;
     while let Some(message) = socket
         .recv_text()
         .await
         .map_err(|error| websocket_gateway_error("Upstream websocket receive failed", error))?
     {
+        if let Some(response_id) = websocket_message_response_id(&message) {
+            current_response_id = Some(response_id);
+        }
+        if intercept_chatmock_job_tool_call(
+            &socket,
+            job_manager.as_ref(),
+            &message,
+            current_response_id.as_deref(),
+        )
+        .await?
+        {
+            continue;
+        }
         body.push_str("data: ");
         body.push_str(&message);
         body.push_str("\n\n");
@@ -325,22 +419,30 @@ pub async fn send_responses_create_request(
 
 pub async fn send_stateful_responses_create_request(
     connector: &ResponsesWebsocketConnector,
-    registry: &RetainedUpstreamWebsocketRegistry<SharedUpstreamWebsocket>,
-    session_id: &str,
+    registry: Arc<RetainedUpstreamWebsocketRegistry<SharedUpstreamWebsocket>>,
+    _session_id: &str,
     payload: Value,
     previous_response_id: Option<&str>,
+    job_manager: Option<Arc<JobManager>>,
 ) -> Result<UpstreamResponse, Response> {
     let lease = registry
-        .acquire_async(previous_response_id, || {
-            connector.connect(session_id.to_string())
+        .acquire_async_with_metadata(previous_response_id, |metadata| async move {
+            let context = ResponsesWebsocketConnectContext {
+                session_id: metadata.session_id,
+                thread_id: metadata.thread_id,
+                window_generation: metadata.window_generation,
+                turn_state: metadata.turn_state,
+            };
+            connector.connect(context).await
         })
         .await
         .map_err(websocket_registry_error)?;
+    let mut guard = RetainedUpstreamWebsocketLeaseGuard::new(Arc::clone(&registry), lease);
+    guard.set_turn_state(guard.lease().upstream_ws.upgrade_turn_state());
 
     let outbound = serde_json::to_string(&websocket_request_payload(payload))
         .expect("responses websocket payload json");
-    if let Err(error) = lease.upstream_ws.send_text(outbound).await {
-        registry.release(lease, false, None);
+    if let Err(error) = guard.lease().upstream_ws.send_text(outbound).await {
         return Err(websocket_gateway_error(
             "Upstream websocket request failed",
             error,
@@ -351,10 +453,9 @@ pub async fn send_stateful_responses_create_request(
     let mut retained_response_id = None;
     let mut retain = false;
     loop {
-        let message = match lease.upstream_ws.recv_text().await {
+        let message = match guard.lease().upstream_ws.recv_text().await {
             Ok(message) => message,
             Err(error) => {
-                registry.release(lease, false, None);
                 return Err(websocket_gateway_error(
                     "Upstream websocket receive failed",
                     error,
@@ -366,6 +467,20 @@ pub async fn send_stateful_responses_create_request(
             break;
         };
 
+        if let Some(response_id) = websocket_message_response_id(&message) {
+            retained_response_id = Some(response_id);
+        }
+        if intercept_chatmock_job_tool_call(
+            &guard.lease().upstream_ws,
+            job_manager.as_ref(),
+            &message,
+            retained_response_id.as_deref(),
+        )
+        .await?
+        {
+            continue;
+        }
+
         body.push_str("data: ");
         body.push_str(&message);
         body.push_str("\n\n");
@@ -376,6 +491,9 @@ pub async fn send_stateful_responses_create_request(
             }
             if metadata.completed {
                 retain = retained_response_id.is_some();
+                if let Some(response_id) = retained_response_id.clone() {
+                    guard.mark_completed(response_id);
+                }
                 break;
             }
             if metadata.failed || metadata.errored {
@@ -384,12 +502,152 @@ pub async fn send_stateful_responses_create_request(
         }
     }
 
-    registry.release(lease, retain, retained_response_id.as_deref());
+    if !retain {
+        drop(retained_response_id);
+    }
+    guard.release();
 
     Ok(UpstreamResponse {
         status_code: StatusCode::OK,
         content_type: Some("text/event-stream".to_string()),
         body: body.into_bytes(),
+    })
+}
+
+pub async fn send_stateful_responses_create_stream(
+    connector: &ResponsesWebsocketConnector,
+    registry: Arc<RetainedUpstreamWebsocketRegistry<SharedUpstreamWebsocket>>,
+    _session_id: &str,
+    payload: Value,
+    previous_response_id: Option<&str>,
+    stream_config: StatefulResponsesWebsocketStreamConfig,
+    job_manager: Option<Arc<JobManager>>,
+) -> Result<Response<Body>, Response> {
+    let lease = registry
+        .acquire_async_with_metadata(previous_response_id, |metadata| async move {
+            let context = ResponsesWebsocketConnectContext {
+                session_id: metadata.session_id,
+                thread_id: metadata.thread_id,
+                window_generation: metadata.window_generation,
+                turn_state: metadata.turn_state,
+            };
+            connector.connect(context).await
+        })
+        .await
+        .map_err(websocket_registry_error)?;
+    let mut guard = RetainedUpstreamWebsocketLeaseGuard::new(Arc::clone(&registry), lease);
+    guard.set_turn_state(guard.lease().upstream_ws.upgrade_turn_state());
+
+    let outbound = serde_json::to_string(&websocket_request_payload(payload))
+        .expect("responses websocket payload json");
+    if let Err(error) = guard.lease().upstream_ws.send_text(outbound).await {
+        drop(guard);
+        return Err(websocket_gateway_error(
+            "Upstream websocket request failed",
+            error,
+        ));
+    }
+
+    Ok(crate::routes::event_streaming_response(
+        StatusCode::OK,
+        stateful_sse_stream(guard, stream_config, job_manager),
+    ))
+}
+
+fn stateful_sse_stream(
+    mut guard: RetainedUpstreamWebsocketLeaseGuard<SharedUpstreamWebsocket>,
+    config: StatefulResponsesWebsocketStreamConfig,
+    job_manager: Option<Arc<JobManager>>,
+) -> BoxStream<'static, Result<Vec<u8>, Infallible>> {
+    let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, Infallible>>(8);
+    tokio::spawn(async move {
+        let mut retained_response_id = None;
+        let mut downstream_open = true;
+        let mut disconnect_deadline = None;
+        let mut keep_alive = interval(config.keep_alive_interval);
+        keep_alive.tick().await;
+        loop {
+            let message = if downstream_open {
+                tokio::select! {
+                    message = guard.lease().upstream_ws.recv_text() => message,
+                    _ = keep_alive.tick() => {
+                        if sender.send(Ok(b": keep-alive\n\n".to_vec())).await.is_err() {
+                            downstream_open = false;
+                            disconnect_deadline =
+                                Some(Instant::now() + config.disconnect_drain_timeout);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                let Some(deadline) = disconnect_deadline else {
+                    break;
+                };
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match timeout(deadline - now, guard.lease().upstream_ws.recv_text()).await {
+                    Ok(message) => message,
+                    Err(_) => break,
+                }
+            };
+            let message = match message {
+                Ok(Some(message)) => message,
+                Ok(None) | Err(_) => break,
+            };
+
+            if let Some(response_id) = websocket_message_response_id(&message) {
+                retained_response_id = Some(response_id);
+            }
+            match intercept_chatmock_job_tool_call(
+                &guard.lease().upstream_ws,
+                job_manager.as_ref(),
+                &message,
+                retained_response_id.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => break,
+            }
+
+            if downstream_open {
+                let mut frame = Vec::with_capacity(message.len() + 8);
+                frame.extend_from_slice(b"data: ");
+                frame.extend_from_slice(message.as_bytes());
+                frame.extend_from_slice(b"\n\n");
+                if sender.send(Ok(frame)).await.is_err() {
+                    downstream_open = false;
+                    disconnect_deadline = Some(Instant::now() + config.disconnect_drain_timeout);
+                }
+            }
+
+            if let Some(metadata) = websocket_event_metadata(&message) {
+                if metadata.response_id.is_some() {
+                    retained_response_id = metadata.response_id;
+                }
+                if metadata.completed {
+                    if let Some(response_id) = retained_response_id {
+                        guard.mark_completed(response_id);
+                    }
+                    break;
+                }
+                if metadata.failed || metadata.errored {
+                    break;
+                }
+            }
+        }
+    });
+    Box::pin(tokio_stream_from_receiver(receiver))
+}
+
+fn tokio_stream_from_receiver<T: Send + 'static>(
+    receiver: mpsc::Receiver<T>,
+) -> impl futures_util::Stream<Item = T> + Send + 'static {
+    futures_util::stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|item| (item, receiver))
     })
 }
 
@@ -464,6 +722,96 @@ fn websocket_event_metadata(message: &str) -> Option<WebsocketEventMetadata> {
         failed: event_type == "response.failed",
         errored: event_type == "error",
     })
+}
+
+fn websocket_message_response_id(message: &str) -> Option<String> {
+    serde_json::from_str::<Value>(message)
+        .ok()
+        .and_then(|value| event_response_id(&value))
+}
+
+fn event_response_id(value: &Value) -> Option<String> {
+    value
+        .get("response")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("response_id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+async fn intercept_chatmock_job_tool_call(
+    socket: &SharedUpstreamWebsocket,
+    job_manager: Option<&Arc<JobManager>>,
+    message: &str,
+    current_response_id: Option<&str>,
+) -> Result<bool, Response> {
+    let Some(event) = serde_json::from_str::<Value>(message).ok() else {
+        return Ok(false);
+    };
+    if event.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
+        return Ok(false);
+    }
+    let Some(item) = event.get("item").and_then(Value::as_object) else {
+        return Ok(false);
+    };
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return Ok(false);
+    }
+    let Some(name) = item.get("name").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    if !name.starts_with("chatmock_") {
+        return Ok(false);
+    }
+
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    let output = match job_manager {
+        Some(job_manager) => job_manager.execute_tool_call(name, arguments).await,
+        None => serde_json::json!({
+            "status": "failed",
+            "error": {
+                "message": "ChatMock jobs are disabled."
+            }
+        }),
+    };
+    let previous_response_id = current_response_id
+        .map(str::to_string)
+        .or_else(|| event_response_id(&event))
+        .ok_or_else(|| {
+            json_response(
+                StatusCode::BAD_GATEWAY,
+                serde_json::to_value(build_upstream_error(
+                    Some("ChatMock internal tool call did not include a response id"),
+                    UpstreamErrorContext::default(),
+                ))
+                .expect("internal tool error payload"),
+            )
+        })?;
+    let follow_up = serde_json::json!({
+        "type": "response.create",
+        "previous_response_id": previous_response_id,
+        "input": [{
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output.to_string(),
+        }]
+    });
+    socket
+        .send_text(follow_up.to_string())
+        .await
+        .map_err(|error| {
+            websocket_gateway_error("Upstream websocket internal tool follow-up failed", error)
+        })?;
+    Ok(true)
 }
 
 fn websocket_terminal_event(message: &str) -> bool {

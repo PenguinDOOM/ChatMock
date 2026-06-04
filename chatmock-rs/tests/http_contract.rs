@@ -576,3 +576,125 @@ async fn responses_follow_minimal_http_contract() {
         ])
     );
 }
+
+fn shell_echo_command(text: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec!["cmd".to_string(), "/C".to_string(), format!("echo {text}")]
+    } else {
+        vec!["sh".to_string(), "-c".to_string(), format!("echo {text}")]
+    }
+}
+
+async fn wait_for_http_job(
+    client: &reqwest::Client,
+    base_url: &str,
+    job_id: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let body: Value = client
+            .get(format!("{base_url}/_chatmock/jobs/{job_id}"))
+            .send()
+            .await
+            .expect("job get")
+            .json()
+            .await
+            .expect("job json");
+        if matches!(
+            body["status"].as_str(),
+            Some("completed" | "failed" | "cancelled")
+        ) {
+            return body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job did not finish in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn chatmock_jobs_endpoint_is_disabled_by_default() {
+    let _guard = test_lock().lock().await;
+    let server = server::spawn_server(contract_server_config())
+        .await
+        .expect("server should start");
+
+    let response = contract_client()
+        .post(format!("{}/_chatmock/jobs", server.base_url()))
+        .json(&json!({
+            "kind": "shell",
+            "command": shell_echo_command("disabled")
+        }))
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn chatmock_jobs_http_api_starts_reads_and_returns_result() {
+    let _guard = test_lock().lock().await;
+    let server = server::spawn_server(RuntimeConfig {
+        enable_chatmock_jobs: true,
+        ..contract_server_config()
+    })
+    .await
+    .expect("server should start");
+    let client = contract_client();
+
+    let start_body: Value = client
+        .post(format!("{}/_chatmock/jobs", server.base_url()))
+        .json(&json!({
+            "kind": "shell",
+            "command": shell_echo_command("http-job")
+        }))
+        .send()
+        .await
+        .expect("start job")
+        .json()
+        .await
+        .expect("start json");
+    let job_id = start_body["job_id"].as_str().expect("job id");
+
+    let result = wait_for_http_job(&client, &server.base_url(), job_id).await;
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["result"]["exit_code"], 0);
+
+    let output: Value = client
+        .get(format!(
+            "{}/_chatmock/jobs/{job_id}/output?since_offset=0",
+            server.base_url()
+        ))
+        .send()
+        .await
+        .expect("output request")
+        .json()
+        .await
+        .expect("output json");
+    assert!(output["output"]
+        .as_str()
+        .expect("output string")
+        .contains("http-job"));
+}
+
+#[tokio::test]
+async fn chatmock_jobs_http_api_returns_not_found_for_missing_job() {
+    let _guard = test_lock().lock().await;
+    let server = server::spawn_server(RuntimeConfig {
+        enable_chatmock_jobs: true,
+        ..contract_server_config()
+    })
+    .await
+    .expect("server should start");
+
+    let response = contract_client()
+        .get(format!("{}/_chatmock/jobs/job_missing", server.base_url()))
+        .send()
+        .await
+        .expect("missing job request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}

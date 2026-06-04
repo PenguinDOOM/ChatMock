@@ -20,7 +20,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 regex = "1.12"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

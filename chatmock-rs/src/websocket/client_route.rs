@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::upstream_errors::{build_upstream_error, UpstreamErrorContext};
+use crate::websocket::upstream::ResponsesWebsocketConnectContext;
 
 pub(crate) fn router() -> Router<crate::server::AppState> {
     Router::new().route("/v1/responses", get(responses_websocket))
@@ -42,6 +43,7 @@ async fn handle_responses_websocket(
 
     let mut upstream_socket = None;
     let mut upstream_session_id = None;
+    let mut current_response_id = None;
 
     while let Some(result) = client_socket.next().await {
         let message = match result {
@@ -97,8 +99,13 @@ async fn handle_responses_websocket(
             };
 
             session_id = Some(normalized.session_id.clone());
+            let mut normalized_payload = normalized.payload;
+            if state.chatmock_jobs_enabled {
+                crate::jobs::inject_chatmock_job_tools(&mut normalized_payload);
+                crate::jobs::inject_chatmock_job_instructions(&mut normalized_payload);
+            }
             outbound_text = serde_json::to_string(&websocket_response_create_payload(
-                Value::Object(normalized.payload),
+                Value::Object(normalized_payload),
             ))
             .expect("responses websocket payload json");
         } else if upstream_socket.is_none() {
@@ -128,7 +135,8 @@ async fn handle_responses_websocket(
                 return;
             };
 
-            let connected_socket = match connector.connect(next_session_id.clone()).await {
+            let context = ResponsesWebsocketConnectContext::compatibility(next_session_id.clone());
+            let connected_socket = match connector.connect(context).await {
                 Ok(socket) => socket,
                 Err(error) => {
                     let error_message = build_upstream_error(
@@ -215,6 +223,20 @@ async fn handle_responses_websocket(
                 }
             };
 
+            if let Some(response_id) = websocket_message_response_id(&upstream_message) {
+                current_response_id = Some(response_id);
+            }
+            if intercept_chatmock_job_tool_call(
+                active_upstream_socket,
+                &state,
+                &upstream_message,
+                current_response_id.as_deref(),
+            )
+            .await
+            {
+                continue;
+            }
+
             if client_socket
                 .send(Message::Text(upstream_message.clone().into()))
                 .await
@@ -288,6 +310,85 @@ fn websocket_terminal_event(message: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn websocket_message_response_id(message: &str) -> Option<String> {
+    serde_json::from_str::<Value>(message)
+        .ok()
+        .and_then(|value| event_response_id(&value))
+}
+
+fn event_response_id(value: &Value) -> Option<String> {
+    value
+        .get("response")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("response_id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+async fn intercept_chatmock_job_tool_call(
+    upstream_socket: &crate::websocket::upstream::SharedUpstreamWebsocket,
+    state: &crate::server::AppState,
+    message: &str,
+    current_response_id: Option<&str>,
+) -> bool {
+    let Some(event) = serde_json::from_str::<Value>(message).ok() else {
+        return false;
+    };
+    if event.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
+        return false;
+    }
+    let Some(item) = event.get("item").and_then(Value::as_object) else {
+        return false;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return false;
+    }
+    let Some(name) = item.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    if !name.starts_with("chatmock_") {
+        return false;
+    }
+
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    let output = if state.chatmock_jobs_enabled {
+        state.job_manager.execute_tool_call(name, arguments).await
+    } else {
+        serde_json::json!({
+            "status": "failed",
+            "error": {
+                "message": "ChatMock jobs are disabled."
+            }
+        })
+    };
+    let Some(previous_response_id) = current_response_id
+        .map(str::to_string)
+        .or_else(|| event_response_id(&event))
+    else {
+        return true;
+    };
+    let follow_up = serde_json::json!({
+        "type": "response.create",
+        "previous_response_id": previous_response_id,
+        "input": [{
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output.to_string(),
+        }]
+    });
+    let _ = upstream_socket.send_text(follow_up.to_string()).await;
+    true
 }
 
 fn websocket_response_create_payload(payload: Value) -> Value {

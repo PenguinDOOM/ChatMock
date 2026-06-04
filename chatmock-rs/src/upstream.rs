@@ -220,6 +220,40 @@ pub(crate) fn build_upstream_headers(
     headers
 }
 
+pub(crate) fn build_upstream_websocket_headers(
+    access_token: &str,
+    account_id: &str,
+    session_id: &str,
+    thread_id: &str,
+    window_generation: u64,
+    _turn_state: Option<&str>,
+) -> HeaderMap {
+    let mut headers =
+        build_upstream_headers(access_token, account_id, session_id, "application/json");
+    headers.insert(
+        "OpenAI-Beta",
+        HeaderValue::from_static("responses_websockets=2026-02-06"),
+    );
+    headers.insert(
+        "session-id",
+        HeaderValue::from_str(session_id).expect("session-id header"),
+    );
+    headers.insert(
+        "thread-id",
+        HeaderValue::from_str(thread_id).expect("thread-id header"),
+    );
+    headers.insert(
+        "x-client-request-id",
+        HeaderValue::from_str(thread_id).expect("client request header"),
+    );
+    headers.insert(
+        "x-codex-window-id",
+        HeaderValue::from_str(&format!("{thread_id}:{window_generation}"))
+            .expect("window id header"),
+    );
+    headers
+}
+
 fn effective_session_id(session_id: Option<&str>, responses_payload: &Value) -> String {
     if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) {
         return session_id.to_string();
