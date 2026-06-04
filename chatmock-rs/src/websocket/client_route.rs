@@ -185,6 +185,8 @@ async fn handle_responses_websocket(
             break;
         }
 
+        let mut response_buffer = Vec::new();
+        let mut pending_internal_outputs = Vec::new();
         loop {
             let upstream_message = match active_upstream_socket.recv_text().await {
                 Ok(Some(message)) => message,
@@ -226,26 +228,63 @@ async fn handle_responses_websocket(
             if let Some(response_id) = websocket_message_response_id(&upstream_message) {
                 current_response_id = Some(response_id);
             }
-            if intercept_chatmock_job_tool_call(
-                active_upstream_socket,
-                &state,
-                &upstream_message,
-                current_response_id.as_deref(),
-            )
-            .await
+            if let Some(output) =
+                maybe_intercept_chatmock_job_tool_call(&state, &upstream_message).await
             {
+                pending_internal_outputs.push(output);
                 continue;
             }
 
-            if client_socket
-                .send(Message::Text(upstream_message.clone().into()))
-                .await
-                .is_err()
-            {
-                return;
+            if let Some(metadata) = websocket_event_metadata(&upstream_message) {
+                if metadata.response_id.is_some() {
+                    current_response_id = metadata.response_id;
+                }
+                if metadata.completed && !pending_internal_outputs.is_empty() {
+                    let Some(previous_response_id) = current_response_id.as_deref() else {
+                        continue;
+                    };
+                    if let Err(error) = send_pending_internal_tool_follow_up(
+                        active_upstream_socket,
+                        previous_response_id,
+                        &mut pending_internal_outputs,
+                    )
+                    .await
+                    {
+                        let error_message = build_upstream_error(
+                            Some("Upstream websocket internal tool follow-up failed"),
+                            UpstreamErrorContext {
+                                exception: Some(error.to_string()),
+                                ..UpstreamErrorContext::default()
+                            },
+                        )
+                        .error
+                        .message;
+                        let _ = send_websocket_error_event(
+                            &mut client_socket,
+                            &error_message,
+                            StatusCode::BAD_GATEWAY,
+                        )
+                        .await;
+                        return;
+                    }
+                    current_response_id = None;
+                    response_buffer.clear();
+                    continue;
+                }
             }
 
+            response_buffer.push(upstream_message.clone());
+
             if websocket_terminal_event(&upstream_message) {
+                for buffered_message in response_buffer.drain(..) {
+                    if client_socket
+                        .send(Message::Text(buffered_message.into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 break;
             }
         }
@@ -328,29 +367,49 @@ fn event_response_id(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn intercept_chatmock_job_tool_call(
-    upstream_socket: &crate::websocket::upstream::SharedUpstreamWebsocket,
+#[derive(Debug)]
+struct WebsocketEventMetadata {
+    response_id: Option<String>,
+    completed: bool,
+}
+
+fn websocket_event_metadata(message: &str) -> Option<WebsocketEventMetadata> {
+    let value = serde_json::from_str::<Value>(message).ok()?;
+    let event_type = value.get("type").and_then(Value::as_str)?;
+    let response_id = event_response_id(&value);
+    Some(WebsocketEventMetadata {
+        response_id,
+        completed: event_type == "response.completed",
+    })
+}
+
+#[derive(Debug)]
+struct PendingInternalToolOutput {
+    call_id: String,
+    output: Value,
+}
+
+async fn maybe_intercept_chatmock_job_tool_call(
     state: &crate::server::AppState,
     message: &str,
-    current_response_id: Option<&str>,
-) -> bool {
+) -> Option<PendingInternalToolOutput> {
     let Some(event) = serde_json::from_str::<Value>(message).ok() else {
-        return false;
+        return None;
     };
     if event.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
-        return false;
+        return None;
     }
     let Some(item) = event.get("item").and_then(Value::as_object) else {
-        return false;
+        return None;
     };
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
-        return false;
+        return None;
     }
     let Some(name) = item.get("name").and_then(Value::as_str) else {
-        return false;
+        return None;
     };
     if !name.starts_with("chatmock_") {
-        return false;
+        return None;
     }
 
     let call_id = item
@@ -372,23 +431,33 @@ async fn intercept_chatmock_job_tool_call(
             }
         })
     };
-    let Some(previous_response_id) = current_response_id
-        .map(str::to_string)
-        .or_else(|| event_response_id(&event))
-    else {
-        return true;
-    };
+    Some(PendingInternalToolOutput {
+        call_id: call_id.to_string(),
+        output,
+    })
+}
+
+async fn send_pending_internal_tool_follow_up(
+    upstream_socket: &crate::websocket::upstream::SharedUpstreamWebsocket,
+    previous_response_id: &str,
+    pending_outputs: &mut Vec<PendingInternalToolOutput>,
+) -> Result<(), crate::websocket::upstream::BoxedUpstreamWebsocketError> {
+    let input = pending_outputs
+        .drain(..)
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": tool.call_id,
+                "output": tool.output.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
     let follow_up = serde_json::json!({
         "type": "response.create",
         "previous_response_id": previous_response_id,
-        "input": [{
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output.to_string(),
-        }]
+        "input": input
     });
-    let _ = upstream_socket.send_text(follow_up.to_string()).await;
-    true
+    upstream_socket.send_text(follow_up.to_string()).await
 }
 
 fn websocket_response_create_payload(payload: Value) -> Value {

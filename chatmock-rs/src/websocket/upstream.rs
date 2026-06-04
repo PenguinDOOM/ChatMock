@@ -382,7 +382,9 @@ pub async fn send_responses_create_request(
         .map_err(|error| websocket_gateway_error("Upstream websocket request failed", error))?;
 
     let mut body = String::new();
+    let mut response_buffer = String::new();
     let mut current_response_id = None;
+    let mut pending_internal_outputs = Vec::new();
     while let Some(message) = socket
         .recv_text()
         .await
@@ -391,21 +393,34 @@ pub async fn send_responses_create_request(
         if let Some(response_id) = websocket_message_response_id(&message) {
             current_response_id = Some(response_id);
         }
-        if intercept_chatmock_job_tool_call(
-            &socket,
-            job_manager.as_ref(),
-            &message,
-            current_response_id.as_deref(),
-        )
-        .await?
+        if let Some(output) =
+            maybe_intercept_chatmock_job_tool_call(job_manager.as_ref(), &message).await?
         {
+            pending_internal_outputs.push(output);
             continue;
         }
-        body.push_str("data: ");
-        body.push_str(&message);
-        body.push_str("\n\n");
+
+        if let Some(metadata) = websocket_event_metadata(&message) {
+            if metadata.completed && !pending_internal_outputs.is_empty() {
+                send_pending_internal_tool_follow_up(
+                    &socket,
+                    metadata
+                        .response_id
+                        .as_deref()
+                        .or(current_response_id.as_deref()),
+                    &mut pending_internal_outputs,
+                )
+                .await?;
+                current_response_id = None;
+                response_buffer.clear();
+                continue;
+            }
+        }
+
+        push_sse_message(&mut response_buffer, &message);
 
         if websocket_terminal_event(&message) {
+            body.push_str(&response_buffer);
             break;
         }
     }
@@ -450,7 +465,9 @@ pub async fn send_stateful_responses_create_request(
     }
 
     let mut body = String::new();
+    let mut response_buffer = String::new();
     let mut retained_response_id = None;
+    let mut pending_internal_outputs = Vec::new();
     let mut retain = false;
     loop {
         let message = match guard.lease().upstream_ws.recv_text().await {
@@ -470,26 +487,36 @@ pub async fn send_stateful_responses_create_request(
         if let Some(response_id) = websocket_message_response_id(&message) {
             retained_response_id = Some(response_id);
         }
-        if intercept_chatmock_job_tool_call(
-            &guard.lease().upstream_ws,
-            job_manager.as_ref(),
-            &message,
-            retained_response_id.as_deref(),
-        )
-        .await?
+        if let Some(output) =
+            maybe_intercept_chatmock_job_tool_call(job_manager.as_ref(), &message).await?
         {
+            pending_internal_outputs.push(output);
             continue;
         }
 
-        body.push_str("data: ");
-        body.push_str(&message);
-        body.push_str("\n\n");
-
-        if let Some(metadata) = websocket_event_metadata(&message) {
+        let metadata = websocket_event_metadata(&message);
+        if let Some(metadata) = metadata.as_ref() {
             if metadata.response_id.is_some() {
-                retained_response_id = metadata.response_id;
+                retained_response_id = metadata.response_id.clone();
             }
+            if metadata.completed && !pending_internal_outputs.is_empty() {
+                send_pending_internal_tool_follow_up(
+                    &guard.lease().upstream_ws,
+                    retained_response_id.as_deref(),
+                    &mut pending_internal_outputs,
+                )
+                .await?;
+                retained_response_id = None;
+                response_buffer.clear();
+                continue;
+            }
+        }
+
+        push_sse_message(&mut response_buffer, &message);
+
+        if let Some(metadata) = metadata {
             if metadata.completed {
+                body.push_str(&response_buffer);
                 retain = retained_response_id.is_some();
                 if let Some(response_id) = retained_response_id.clone() {
                     guard.mark_completed(response_id);
@@ -497,6 +524,7 @@ pub async fn send_stateful_responses_create_request(
                 break;
             }
             if metadata.failed || metadata.errored {
+                body.push_str(&response_buffer);
                 break;
             }
         }
@@ -562,6 +590,7 @@ fn stateful_sse_stream(
     let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, Infallible>>(8);
     tokio::spawn(async move {
         let mut retained_response_id = None;
+        let mut pending_internal_outputs = Vec::new();
         let mut downstream_open = true;
         let mut disconnect_deadline = None;
         let mut keep_alive = interval(config.keep_alive_interval);
@@ -600,34 +629,45 @@ fn stateful_sse_stream(
             if let Some(response_id) = websocket_message_response_id(&message) {
                 retained_response_id = Some(response_id);
             }
-            match intercept_chatmock_job_tool_call(
-                &guard.lease().upstream_ws,
-                job_manager.as_ref(),
-                &message,
-                retained_response_id.as_deref(),
-            )
-            .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {}
+            match maybe_intercept_chatmock_job_tool_call(job_manager.as_ref(), &message).await {
+                Ok(Some(output)) => {
+                    pending_internal_outputs.push(output);
+                    continue;
+                }
+                Ok(None) => {}
                 Err(_) => break,
             }
 
+            let metadata = websocket_event_metadata(&message);
+            if let Some(metadata) = metadata.as_ref() {
+                if metadata.response_id.is_some() {
+                    retained_response_id = metadata.response_id.clone();
+                }
+                if metadata.completed && !pending_internal_outputs.is_empty() {
+                    if send_pending_internal_tool_follow_up(
+                        &guard.lease().upstream_ws,
+                        retained_response_id.as_deref(),
+                        &mut pending_internal_outputs,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    retained_response_id = None;
+                    continue;
+                }
+            }
+
             if downstream_open {
-                let mut frame = Vec::with_capacity(message.len() + 8);
-                frame.extend_from_slice(b"data: ");
-                frame.extend_from_slice(message.as_bytes());
-                frame.extend_from_slice(b"\n\n");
+                let frame = sse_frame(&message);
                 if sender.send(Ok(frame)).await.is_err() {
                     downstream_open = false;
                     disconnect_deadline = Some(Instant::now() + config.disconnect_drain_timeout);
                 }
             }
 
-            if let Some(metadata) = websocket_event_metadata(&message) {
-                if metadata.response_id.is_some() {
-                    retained_response_id = metadata.response_id;
-                }
+            if let Some(metadata) = metadata {
                 if metadata.completed {
                     if let Some(response_id) = retained_response_id {
                         guard.mark_completed(response_id);
@@ -641,6 +681,20 @@ fn stateful_sse_stream(
         }
     });
     Box::pin(tokio_stream_from_receiver(receiver))
+}
+
+fn push_sse_message(body: &mut String, message: &str) {
+    body.push_str("data: ");
+    body.push_str(message);
+    body.push_str("\n\n");
+}
+
+fn sse_frame(message: &str) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(message.len() + 8);
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(message.as_bytes());
+    frame.extend_from_slice(b"\n\n");
+    frame
 }
 
 fn tokio_stream_from_receiver<T: Send + 'static>(
@@ -740,29 +794,33 @@ fn event_response_id(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn intercept_chatmock_job_tool_call(
-    socket: &SharedUpstreamWebsocket,
+#[derive(Debug)]
+struct PendingInternalToolOutput {
+    call_id: String,
+    output: Value,
+}
+
+async fn maybe_intercept_chatmock_job_tool_call(
     job_manager: Option<&Arc<JobManager>>,
     message: &str,
-    current_response_id: Option<&str>,
-) -> Result<bool, Response> {
+) -> Result<Option<PendingInternalToolOutput>, Response> {
     let Some(event) = serde_json::from_str::<Value>(message).ok() else {
-        return Ok(false);
+        return Ok(None);
     };
     if event.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(item) = event.get("item").and_then(Value::as_object) else {
-        return Ok(false);
+        return Ok(None);
     };
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(name) = item.get("name").and_then(Value::as_str) else {
-        return Ok(false);
+        return Ok(None);
     };
     if !name.starts_with("chatmock_") {
-        return Ok(false);
+        return Ok(None);
     }
 
     let call_id = item
@@ -783,27 +841,41 @@ async fn intercept_chatmock_job_tool_call(
             }
         }),
     };
-    let previous_response_id = current_response_id
-        .map(str::to_string)
-        .or_else(|| event_response_id(&event))
-        .ok_or_else(|| {
-            json_response(
-                StatusCode::BAD_GATEWAY,
-                serde_json::to_value(build_upstream_error(
-                    Some("ChatMock internal tool call did not include a response id"),
-                    UpstreamErrorContext::default(),
-                ))
-                .expect("internal tool error payload"),
-            )
-        })?;
+    Ok(Some(PendingInternalToolOutput {
+        call_id: call_id.to_string(),
+        output,
+    }))
+}
+
+async fn send_pending_internal_tool_follow_up(
+    socket: &SharedUpstreamWebsocket,
+    previous_response_id: Option<&str>,
+    pending_outputs: &mut Vec<PendingInternalToolOutput>,
+) -> Result<(), Response> {
+    let previous_response_id = previous_response_id.ok_or_else(|| {
+        json_response(
+            StatusCode::BAD_GATEWAY,
+            serde_json::to_value(build_upstream_error(
+                Some("ChatMock internal tool call did not include a response id"),
+                UpstreamErrorContext::default(),
+            ))
+            .expect("internal tool error payload"),
+        )
+    })?;
+    let input = pending_outputs
+        .drain(..)
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": tool.call_id,
+                "output": tool.output.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
     let follow_up = serde_json::json!({
         "type": "response.create",
         "previous_response_id": previous_response_id,
-        "input": [{
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output.to_string(),
-        }]
+        "input": input
     });
     socket
         .send_text(follow_up.to_string())
@@ -811,7 +883,7 @@ async fn intercept_chatmock_job_tool_call(
         .map_err(|error| {
             websocket_gateway_error("Upstream websocket internal tool follow-up failed", error)
         })?;
-    Ok(true)
+    Ok(())
 }
 
 fn websocket_terminal_event(message: &str) -> bool {

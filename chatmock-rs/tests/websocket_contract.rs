@@ -349,6 +349,10 @@ async fn responses_route_intercepts_chatmock_job_tool_calls() {
             }
         })),
         ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_tool_turn", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::text(json!({
             "type": "response.created",
             "response": {"id": "resp_after_tool", "object": "response", "status": "in_progress"}
         })),
@@ -409,6 +413,84 @@ async fn responses_route_intercepts_chatmock_job_tool_calls() {
         .as_str()
         .expect("tool output")
         .contains("Job not found"));
+}
+
+#[tokio::test]
+async fn responses_route_batches_multiple_chatmock_job_tool_calls_after_completed() {
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_tool_batch", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "chatmock_poll_job",
+                "call_id": "call_chatmock_poll",
+                "arguments": "{\"job_id\":\"job_missing\",\"max_wait_ms\":60000}"
+            }
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "chatmock_get_job_result",
+                "call_id": "call_chatmock_result",
+                "arguments": "{\"job_id\":\"job_missing\"}"
+            }
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_tool_batch", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_after_batch", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_after_batch", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            enable_chatmock_jobs: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            Box::pin(async move { Ok(socket) })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({"model": "gpt-5.4", "input": "check jobs"}))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["id"], "resp_after_batch");
+
+    let sent_messages = scripted_socket.scripted_sent_messages().await;
+    assert_eq!(sent_messages.len(), 2);
+    let follow_up: Value = serde_json::from_str(&sent_messages[1]).expect("follow-up outbound");
+    assert_eq!(follow_up["type"], "response.create");
+    assert_eq!(follow_up["previous_response_id"], "resp_tool_batch");
+    assert_eq!(follow_up["input"].as_array().expect("input").len(), 2);
+    assert_eq!(follow_up["input"][0]["call_id"], "call_chatmock_poll");
+    assert_eq!(follow_up["input"][1]["call_id"], "call_chatmock_result");
 }
 
 #[tokio::test]
@@ -713,6 +795,125 @@ async fn responses_route_reuses_retained_websocket_for_previous_response_id() {
 }
 
 #[tokio::test]
+async fn responses_route_stateful_internal_tool_retains_final_response_marker() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_tool_turn", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "chatmock_poll_job",
+                "call_id": "call_chatmock_poll",
+                "arguments": "{\"job_id\":\"job_missing\",\"max_wait_ms\":60000}"
+            }
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_tool_turn", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_after_tool", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_after_tool", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_followup", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_followup", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            enable_chatmock_jobs: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            Box::pin(async move {
+                connect_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(socket)
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .header("X-Session-Id", "stateful-session")
+        .json(&json!({"model": "gpt-5.4", "input": "check job"}))
+        .send()
+        .await
+        .expect("first request should succeed");
+
+    let first_status = first_response.status();
+    let first_body: Value = first_response.json().await.expect("first json body");
+    assert_eq!(first_status, reqwest::StatusCode::OK);
+    assert_eq!(first_body["id"], "resp_after_tool");
+
+    let rejected_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .header("X-Session-Id", "stateful-session")
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "wrong marker",
+            "previous_response_id": "resp_tool_turn"
+        }))
+        .send()
+        .await
+        .expect("rejected request should complete");
+    assert_eq!(rejected_response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let follow_up_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .header("X-Session-Id", "stateful-session")
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "correct marker",
+            "previous_response_id": "resp_after_tool"
+        }))
+        .send()
+        .await
+        .expect("follow-up should succeed");
+
+    let follow_up_status = follow_up_response.status();
+    let follow_up_body: Value = follow_up_response
+        .json()
+        .await
+        .expect("follow-up json body");
+    assert_eq!(follow_up_status, reqwest::StatusCode::OK);
+    assert_eq!(follow_up_body["id"], "resp_followup");
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+
+    let sent_messages = scripted_socket.scripted_sent_messages().await;
+    assert_eq!(sent_messages.len(), 3);
+    let internal_follow_up: Value =
+        serde_json::from_str(&sent_messages[1]).expect("internal follow-up");
+    let user_follow_up: Value = serde_json::from_str(&sent_messages[2]).expect("user follow-up");
+    assert_eq!(internal_follow_up["previous_response_id"], "resp_tool_turn");
+    assert_eq!(user_follow_up["previous_response_id"], "resp_after_tool");
+}
+
+#[tokio::test]
 async fn responses_route_rejects_missing_retained_marker_in_stateful_mode() {
     let connect_calls = Arc::new(AtomicUsize::new(0));
     let scripted_socket = SharedUpstreamWebsocket::scripted(vec![ScriptedUpstreamReceive::text(
@@ -1012,6 +1213,96 @@ async fn responses_route_stateful_stream_yields_first_chunk_before_completion() 
     assert!(String::from_utf8(rest.to_vec())
         .expect("utf8 completed")
         .contains("\"type\":\"response.completed\""));
+}
+
+#[tokio::test]
+async fn responses_route_stateful_stream_continues_after_internal_tool_follow_up() {
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_tool_stream", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "chatmock_poll_job",
+                "call_id": "call_chatmock_poll",
+                "arguments": "{\"job_id\":\"job_missing\",\"max_wait_ms\":60000}"
+            }
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_tool_stream", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_after_stream_tool", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_after_stream_tool", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            enable_chatmock_jobs: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            Box::pin(async move { Ok(socket) })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let mut response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "check job",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let mut body = String::new();
+    for _ in 0..4 {
+        let Some(chunk) = timeout(Duration::from_secs(1), response.chunk())
+            .await
+            .expect("stream chunk")
+            .expect("stream chunk result")
+        else {
+            break;
+        };
+        body.push_str(&String::from_utf8(chunk.to_vec()).expect("utf8 chunk"));
+        if body.contains("resp_after_stream_tool")
+            && body.contains("\"type\":\"response.completed\"")
+        {
+            break;
+        }
+    }
+
+    assert!(body.contains("resp_after_stream_tool"));
+    assert!(!body.contains("call_chatmock_poll"));
+    assert!(
+        !body.contains("\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_stream\"")
+    );
+
+    let sent_messages = scripted_socket.scripted_sent_messages().await;
+    assert_eq!(sent_messages.len(), 2);
+    let follow_up: Value = serde_json::from_str(&sent_messages[1]).expect("follow-up outbound");
+    assert_eq!(follow_up["previous_response_id"], "resp_tool_stream");
+    assert_eq!(follow_up["input"][0]["call_id"], "call_chatmock_poll");
 }
 
 #[tokio::test]
