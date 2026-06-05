@@ -4,21 +4,20 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use axum::{body::Body, response::Response};
-use futures_util::{stream::BoxStream, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::BoxStream};
 use reqwest::StatusCode;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, Notify};
-use tokio::time::{interval, timeout, Duration, Instant};
+use serde_json::{Value, json};
+use tokio::sync::{Notify, mpsc};
+use tokio::time::{Duration, Instant, interval, timeout};
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
-    MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message, client::IntoClientRequest, protocol::frame::coding::CloseCode},
 };
 
 use crate::{
@@ -26,10 +25,10 @@ use crate::{
     jobs::JobManager,
     routes::json_response,
     upstream::{
-        build_upstream_websocket_headers, refresh_chatgpt_tokens, upstream_websocket_url,
-        UpstreamResponse,
+        UpstreamResponse, build_upstream_websocket_headers, refresh_chatgpt_tokens,
+        upstream_websocket_url,
     },
-    upstream_errors::{build_upstream_error, UpstreamErrorContext},
+    upstream_errors::{UpstreamErrorContext, build_upstream_error},
     websocket::registry::{
         ResponsesWebsocketSessionCapacityError, ResponsesWebsocketSessionConflictError,
         ResponsesWebsocketSessionNotFoundError, RetainedUpstreamWebsocket,
@@ -159,6 +158,7 @@ pub struct ScriptedUpstreamReceive {
 enum ScriptedUpstreamReceiveStep {
     Text(String),
     Wait(Arc<Notify>),
+    Close(UpstreamCloseMetadata),
 }
 
 impl ScriptedUpstreamReceive {
@@ -175,6 +175,12 @@ impl ScriptedUpstreamReceive {
             step: ScriptedUpstreamReceiveStep::Wait(notify),
         }
     }
+
+    pub fn close(code: Option<CloseCode>, reason: Option<String>) -> Self {
+        Self {
+            step: ScriptedUpstreamReceiveStep::Close(UpstreamCloseMetadata { code, reason }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -182,6 +188,7 @@ struct ScriptedUpstreamWebsocketState {
     scripted_receives: VecDeque<ScriptedUpstreamReceiveStep>,
     sent_messages: Vec<String>,
     turn_state: Option<String>,
+    close_metadata: Option<UpstreamCloseMetadata>,
     closed: bool,
 }
 
@@ -189,11 +196,18 @@ struct LiveUpstreamWebsocketState {
     stream: tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>>,
     turn_state: Option<String>,
     closed: AtomicBool,
+    close_metadata: Mutex<Option<UpstreamCloseMetadata>>,
 }
 
 #[derive(Clone)]
 pub struct SharedUpstreamWebsocket {
     backend: SharedUpstreamWebsocketBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamCloseMetadata {
+    pub code: Option<CloseCode>,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -219,6 +233,7 @@ impl SharedUpstreamWebsocket {
                         .collect(),
                     sent_messages: Vec::new(),
                     turn_state: None,
+                    close_metadata: None,
                     closed: false,
                 },
             ))),
@@ -245,6 +260,7 @@ impl SharedUpstreamWebsocket {
                 stream: tokio::sync::Mutex::new(Some(stream)),
                 turn_state,
                 closed: AtomicBool::new(false),
+                close_metadata: Mutex::new(None),
             })),
         }
     }
@@ -286,6 +302,12 @@ impl SharedUpstreamWebsocket {
                 match next {
                     Some(ScriptedUpstreamReceiveStep::Text(message)) => return Ok(Some(message)),
                     Some(ScriptedUpstreamReceiveStep::Wait(notify)) => notify.notified().await,
+                    Some(ScriptedUpstreamReceiveStep::Close(metadata)) => {
+                        let mut state = state.lock().expect("scripted websocket lock");
+                        state.closed = true;
+                        state.close_metadata = Some(metadata);
+                        return Ok(None);
+                    }
                     None => return Ok(None),
                 }
             },
@@ -305,8 +327,27 @@ impl SharedUpstreamWebsocket {
                         stream.send(Message::Pong(payload)).await?;
                     }
                     Some(Message::Pong(_)) | Some(Message::Frame(_)) => {}
-                    Some(Message::Close(_)) | None => {
+                    Some(Message::Close(frame)) => {
                         state.closed.store(true, Ordering::SeqCst);
+                        *state
+                            .close_metadata
+                            .lock()
+                            .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
+                            code: frame.as_ref().map(|frame| frame.code),
+                            reason: frame.as_ref().map(|frame| frame.reason.to_string()),
+                        });
+                        *guard = None;
+                        return Ok(None);
+                    }
+                    None => {
+                        state.closed.store(true, Ordering::SeqCst);
+                        *state
+                            .close_metadata
+                            .lock()
+                            .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
+                            code: None,
+                            reason: None,
+                        });
                         *guard = None;
                         return Ok(None);
                     }
@@ -336,6 +377,21 @@ impl SharedUpstreamWebsocket {
             SharedUpstreamWebsocketBackend::Live(state) => state.turn_state.clone(),
         }
     }
+
+    pub fn close_metadata(&self) -> Option<UpstreamCloseMetadata> {
+        match &self.backend {
+            SharedUpstreamWebsocketBackend::Scripted(state) => state
+                .lock()
+                .expect("scripted websocket lock")
+                .close_metadata
+                .clone(),
+            SharedUpstreamWebsocketBackend::Live(state) => state
+                .close_metadata
+                .lock()
+                .expect("live close metadata lock")
+                .clone(),
+        }
+    }
 }
 
 impl RetainedUpstreamWebsocket for SharedUpstreamWebsocket {
@@ -349,6 +405,13 @@ impl RetainedUpstreamWebsocket for SharedUpstreamWebsocket {
                 if let Ok(mut guard) = state.stream.try_lock() {
                     *guard = None;
                 }
+                *state
+                    .close_metadata
+                    .lock()
+                    .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
+                    code: None,
+                    reason: None,
+                });
             }
         }
     }
@@ -402,7 +465,7 @@ pub async fn send_responses_create_request(
         };
 
         let Some(message) = message else {
-            tracing::warn!(route = ROUTE, "upstream_socket_closed");
+            log_upstream_socket_closed(ROUTE, &socket);
             tracing::debug!(
                 route = ROUTE,
                 reason = "upstream_socket_closed",
@@ -536,7 +599,7 @@ pub async fn send_stateful_responses_create_request(
         };
 
         let Some(message) = message else {
-            tracing::warn!(route = ROUTE, "upstream_socket_closed");
+            log_upstream_socket_closed(ROUTE, &guard.lease().upstream_ws);
             tracing::debug!(
                 route = ROUTE,
                 reason = "upstream_socket_closed",
@@ -738,7 +801,7 @@ fn stateful_sse_stream(
             let message = match message {
                 Ok(Some(message)) => message,
                 Ok(None) => {
-                    tracing::warn!(route = "stateful_sse", "upstream_socket_closed");
+                    log_upstream_socket_closed("stateful_sse", &guard.lease().upstream_ws);
                     tracing::debug!(
                         route = "stateful_sse",
                         reason = "upstream_socket_closed",
@@ -896,6 +959,16 @@ fn trace_upstream_event(route: &str, message: &str) {
         event_type = event_type.as_deref(),
         response_id = response_id.as_deref(),
         "upstream_event_received"
+    );
+}
+
+fn log_upstream_socket_closed(route: &str, socket: &SharedUpstreamWebsocket) {
+    let close = socket.close_metadata();
+    tracing::warn!(
+        route,
+        code = ?close.as_ref().and_then(|metadata| metadata.code.clone()),
+        reason = ?close.as_ref().and_then(|metadata| metadata.reason.as_deref()),
+        "upstream_socket_closed"
     );
 }
 

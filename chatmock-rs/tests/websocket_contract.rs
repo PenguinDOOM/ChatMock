@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chatmock_rs::RuntimeConfig;
 use chatmock_rs::server;
 use chatmock_rs::websocket::registry::{
     ResponsesWebsocketSessionCapacityError, ResponsesWebsocketSessionConflictError,
@@ -10,13 +11,15 @@ use chatmock_rs::websocket::registry::{
 use chatmock_rs::websocket::upstream::{
     ResponsesWebsocketConnectContext, ScriptedUpstreamReceive, SharedUpstreamWebsocket,
 };
-use chatmock_rs::RuntimeConfig;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio::task::yield_now;
-use tokio::time::{timeout, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::time::{Duration, timeout};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, protocol::frame::coding::CloseCode},
+};
 
 #[derive(Debug)]
 struct FakeRetainedUpstreamWebsocket {
@@ -123,6 +126,22 @@ async fn wait_for_sent_messages(socket: &SharedUpstreamWebsocket, expected_len: 
     })
     .await
     .expect("scripted websocket should send expected messages");
+}
+
+#[tokio::test]
+async fn scripted_upstream_websocket_retains_close_code_and_reason() {
+    let socket = SharedUpstreamWebsocket::scripted(vec![ScriptedUpstreamReceive::close(
+        Some(CloseCode::Away),
+        Some("backend drained".to_string()),
+    )]);
+
+    let message = socket.recv_text().await.expect("receive should succeed");
+    let close = socket.close_metadata().expect("close metadata");
+
+    assert!(message.is_none());
+    assert_eq!(close.code, Some(CloseCode::Away));
+    assert_eq!(close.reason.as_deref(), Some("backend drained"));
+    assert!(socket.is_socket_closed());
 }
 
 #[test]
@@ -245,16 +264,51 @@ fn registry_rejects_new_conversation_when_all_capacity_is_in_use() {
     let error = registry
         .acquire(None, || Ok(make_socket()))
         .expect_err("capacity should fail");
-    assert!(error
-        .downcast_ref::<ResponsesWebsocketSessionCapacityError>()
-        .is_some());
+    assert!(
+        error
+            .downcast_ref::<ResponsesWebsocketSessionCapacityError>()
+            .is_some()
+    );
 
     registry.release(first, false, None);
     registry.release(second, false, None);
 }
 
 #[test]
-fn registry_treats_closed_retained_websocket_as_missing_marker() {
+fn registry_reconnects_closed_completed_marker_with_retained_metadata() {
+    let registry = RetainedUpstreamWebsocketRegistry::new(2);
+    let first = registry
+        .acquire(None, || Ok(make_socket()))
+        .expect("first lease");
+    let first_session_id = first.metadata.session_id.clone();
+    let first_thread_id = first.metadata.thread_id.clone();
+    registry.release(first.clone(), true, Some("resp_fixed_1"));
+    first.upstream_ws.lock().expect("lock socket").mark_closed();
+
+    let reconnected = registry
+        .acquire(Some("resp_fixed_1"), || Ok(make_socket()))
+        .expect("closed completed marker should reconnect");
+    assert!(!reconnected.created);
+    assert!(!Arc::ptr_eq(
+        &first.upstream_ws.0,
+        &reconnected.upstream_ws.0
+    ));
+    assert_eq!(reconnected.metadata.session_id, first_session_id);
+    assert_eq!(reconnected.metadata.thread_id, first_thread_id);
+    assert_eq!(reconnected.metadata.window_generation, 1);
+    assert_eq!(
+        reconnected.metadata.last_response_id.as_deref(),
+        Some("resp_fixed_1")
+    );
+    assert_eq!(
+        first.upstream_ws.lock().expect("lock socket").close_calls,
+        1
+    );
+    registry.release(reconnected, true, Some("resp_fixed_2"));
+}
+
+#[tokio::test]
+async fn registry_reconnect_failure_removes_closed_completed_marker() {
     let registry = RetainedUpstreamWebsocketRegistry::new(2);
     let first = registry
         .acquire(None, || Ok(make_socket()))
@@ -263,15 +317,23 @@ fn registry_treats_closed_retained_websocket_as_missing_marker() {
     first.upstream_ws.lock().expect("lock socket").mark_closed();
 
     let error = registry
-        .acquire(Some("resp_fixed_1"), || Ok(make_socket()))
-        .expect_err("closed socket should be treated as missing");
+        .acquire_async_with_metadata(Some("resp_fixed_1"), |_metadata| async {
+            Err(std::io::Error::other("reconnect failed").into())
+        })
+        .await
+        .expect_err("failed reconnect should become missing marker");
     let not_found = error
         .downcast_ref::<ResponsesWebsocketSessionNotFoundError>()
         .expect("not found error");
     assert_eq!(not_found.response_id, "resp_fixed_1");
-    assert_eq!(
-        first.upstream_ws.lock().expect("lock socket").close_calls,
-        1
+
+    let error = registry
+        .acquire(Some("resp_fixed_1"), || Ok(make_socket()))
+        .expect_err("failed reconnect should remove marker");
+    assert!(
+        error
+            .downcast_ref::<ResponsesWebsocketSessionNotFoundError>()
+            .is_some()
     );
 }
 
@@ -394,25 +456,31 @@ async fn responses_route_intercepts_chatmock_job_tool_calls() {
     let sent_messages = scripted_socket.scripted_sent_messages().await;
     assert_eq!(sent_messages.len(), 2);
     let first_outbound: Value = serde_json::from_str(&sent_messages[0]).expect("first outbound");
-    assert!(first_outbound["tools"]
-        .as_array()
-        .expect("tools")
-        .iter()
-        .any(|tool| tool["name"] == "chatmock_start_job"));
-    assert!(first_outbound["instructions"]
-        .as_str()
-        .expect("instructions")
-        .contains("chatmock_start_job"));
+    assert!(
+        first_outbound["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["name"] == "chatmock_start_job")
+    );
+    assert!(
+        first_outbound["instructions"]
+            .as_str()
+            .expect("instructions")
+            .contains("chatmock_start_job")
+    );
 
     let follow_up: Value = serde_json::from_str(&sent_messages[1]).expect("follow-up outbound");
     assert_eq!(follow_up["type"], "response.create");
     assert_eq!(follow_up["previous_response_id"], "resp_tool_turn");
     assert_eq!(follow_up["input"][0]["type"], "function_call_output");
     assert_eq!(follow_up["input"][0]["call_id"], "call_chatmock_poll");
-    assert!(follow_up["input"][0]["output"]
-        .as_str()
-        .expect("tool output")
-        .contains("Job not found"));
+    assert!(
+        follow_up["input"][0]["output"]
+            .as_str()
+            .expect("tool output")
+            .contains("Job not found")
+    );
 }
 
 #[tokio::test]
@@ -795,6 +863,185 @@ async fn responses_route_reuses_retained_websocket_for_previous_response_id() {
 }
 
 #[tokio::test]
+async fn responses_route_reconnects_closed_completed_marker_for_previous_response_id() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let connect_contexts = Arc::new(Mutex::new(Vec::<ResponsesWebsocketConnectContext>::new()));
+    let first_socket = SharedUpstreamWebsocket::scripted_with_turn_state(
+        vec![
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.created",
+                "response": {"id": "resp_ws_closed_1", "object": "response", "status": "in_progress"}
+            })),
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.completed",
+                "response": {"id": "resp_ws_closed_1", "object": "response", "status": "completed", "output": []}
+            })),
+        ],
+        "turn-state-closed-1",
+    );
+    let second_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_ws_closed_2", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_closed_2", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let first_socket_for_connector = first_socket.clone();
+    let second_socket_for_connector = second_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+    let connect_contexts_for_connector = Arc::clone(&connect_contexts);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |context| {
+            let first_socket = first_socket_for_connector.clone();
+            let second_socket = second_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            let connect_contexts = Arc::clone(&connect_contexts_for_connector);
+            Box::pin(async move {
+                connect_contexts
+                    .lock()
+                    .expect("lock contexts")
+                    .push(context);
+                match connect_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(first_socket),
+                    1 => Ok(second_socket),
+                    _ => Err(std::io::Error::other("unexpected websocket connect").into()),
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first_body: Value = first_response.json().await.expect("first json body");
+    assert_eq!(first_body["id"], "resp_ws_closed_1");
+
+    first_socket.close_socket();
+
+    let second_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_ws_closed_1"
+        }))
+        .send()
+        .await
+        .expect("second request should succeed");
+    assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+    let second_body: Value = second_response.json().await.expect("second json body");
+    assert_eq!(second_body["id"], "resp_ws_closed_2");
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+
+    {
+        let contexts = connect_contexts.lock().expect("lock contexts");
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[1].session_id, contexts[0].session_id);
+        assert_eq!(contexts[1].thread_id, contexts[0].thread_id);
+        assert_eq!(contexts[1].window_generation, 1);
+        assert_eq!(
+            contexts[1].turn_state.as_deref(),
+            Some("turn-state-closed-1")
+        );
+    }
+
+    let first_sent = first_socket.scripted_sent_messages().await;
+    let second_sent = second_socket.scripted_sent_messages().await;
+    assert_eq!(first_sent.len(), 1);
+    assert_eq!(second_sent.len(), 1);
+    let outbound: Value = serde_json::from_str(&second_sent[0]).expect("second outbound");
+    assert_eq!(outbound["previous_response_id"], "resp_ws_closed_1");
+}
+
+#[tokio::test]
+async fn responses_route_returns_previous_response_not_found_when_reconnect_fails() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let first_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_ws_reconnect_fail_1", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_reconnect_fail_1", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let first_socket_for_connector = first_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let first_socket = first_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            Box::pin(async move {
+                match connect_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(first_socket),
+                    _ => Err(std::io::Error::other("reconnect failed").into()),
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+
+    first_socket.close_socket();
+
+    let second_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_ws_reconnect_fail_1"
+        }))
+        .send()
+        .await
+        .expect("second request should complete");
+    let status = second_response.status();
+    let body: Value = second_response.json().await.expect("second json body");
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "previous_response_not_found");
+    assert_eq!(
+        body["error"]["message"],
+        "No response found for previous_response_id resp_ws_reconnect_fail_1."
+    );
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn responses_route_stateful_internal_tool_retains_final_response_marker() {
     let connect_calls = Arc::new(AtomicUsize::new(0));
     let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
@@ -1036,6 +1283,198 @@ async fn responses_route_streams_previous_response_not_found_for_missing_retaine
 }
 
 #[tokio::test]
+async fn responses_route_stream_reconnects_closed_completed_marker_for_previous_response_id() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let connect_contexts = Arc::new(Mutex::new(Vec::<ResponsesWebsocketConnectContext>::new()));
+    let first_socket = SharedUpstreamWebsocket::scripted_with_turn_state(
+        vec![
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.created",
+                "response": {"id": "resp_stream_closed_1", "object": "response", "status": "in_progress"}
+            })),
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.completed",
+                "response": {"id": "resp_stream_closed_1", "object": "response", "status": "completed", "output": []}
+            })),
+        ],
+        "turn-state-stream-closed-1",
+    );
+    let second_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_stream_closed_2", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_stream_closed_2", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let first_socket_for_connector = first_socket.clone();
+    let second_socket_for_connector = second_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+    let connect_contexts_for_connector = Arc::clone(&connect_contexts);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |context| {
+            let first_socket = first_socket_for_connector.clone();
+            let second_socket = second_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            let connect_contexts = Arc::clone(&connect_contexts_for_connector);
+            Box::pin(async move {
+                connect_contexts
+                    .lock()
+                    .expect("lock contexts")
+                    .push(context);
+                match connect_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(first_socket),
+                    1 => Ok(second_socket),
+                    _ => Err(std::io::Error::other("unexpected websocket connect").into()),
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first_body = first_response.text().await.expect("first stream body");
+    assert!(first_body.contains("resp_stream_closed_1"));
+
+    first_socket.close_socket();
+
+    let second_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_stream_closed_1",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("second request should succeed");
+    assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+    let second_body = second_response.text().await.expect("second stream body");
+    assert!(second_body.contains("resp_stream_closed_2"));
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+
+    {
+        let contexts = connect_contexts.lock().expect("lock contexts");
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[1].session_id, contexts[0].session_id);
+        assert_eq!(contexts[1].thread_id, contexts[0].thread_id);
+        assert_eq!(contexts[1].window_generation, 1);
+        assert_eq!(
+            contexts[1].turn_state.as_deref(),
+            Some("turn-state-stream-closed-1")
+        );
+    }
+
+    let second_sent = second_socket.scripted_sent_messages().await;
+    assert_eq!(second_sent.len(), 1);
+    let outbound: Value = serde_json::from_str(&second_sent[0]).expect("second outbound");
+    assert_eq!(outbound["previous_response_id"], "resp_stream_closed_1");
+}
+
+#[tokio::test]
+async fn responses_route_streams_previous_response_not_found_when_reconnect_fails() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let first_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_stream_reconnect_fail_1", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_stream_reconnect_fail_1", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let first_socket_for_connector = first_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let first_socket = first_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            Box::pin(async move {
+                match connect_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(first_socket),
+                    _ => Err(std::io::Error::other("reconnect failed").into()),
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first_body = first_response.text().await.expect("first stream body");
+    assert!(first_body.contains("resp_stream_reconnect_fail_1"));
+
+    first_socket.close_socket();
+
+    let second_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_stream_reconnect_fail_1",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("second request should complete");
+    let status = second_response.status();
+    let body = second_response.text().await.expect("second stream body");
+    let event = first_sse_event(&body);
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["status_code"], 400);
+    assert_eq!(event["error"]["code"], "previous_response_not_found");
+    assert_eq!(
+        event["error"]["message"],
+        "No response found for previous_response_id resp_stream_reconnect_fail_1."
+    );
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn responses_route_rejects_same_retained_marker_while_follow_up_is_in_progress() {
     let connect_calls = Arc::new(AtomicUsize::new(0));
     let release_second_turn = Arc::new(Notify::new());
@@ -1210,9 +1649,11 @@ async fn responses_route_stateful_stream_yields_first_chunk_before_completion() 
         .expect("completed chunk")
         .expect("completed chunk result")
         .expect("completed chunk bytes");
-    assert!(String::from_utf8(rest.to_vec())
-        .expect("utf8 completed")
-        .contains("\"type\":\"response.completed\""));
+    assert!(
+        String::from_utf8(rest.to_vec())
+            .expect("utf8 completed")
+            .contains("\"type\":\"response.completed\"")
+    );
 }
 
 #[tokio::test]
@@ -1413,9 +1854,11 @@ async fn responses_route_stateful_stream_drains_after_client_disconnect_to_compl
         .expect("first chunk")
         .expect("first chunk result")
         .expect("first chunk bytes");
-    assert!(String::from_utf8(first_chunk.to_vec())
-        .expect("utf8 first")
-        .contains("\"type\":\"response.created\""));
+    assert!(
+        String::from_utf8(first_chunk.to_vec())
+            .expect("utf8 first")
+            .contains("\"type\":\"response.created\"")
+    );
     drop(first_response);
 
     release_completion.notify_waiters();

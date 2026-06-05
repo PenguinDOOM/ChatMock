@@ -119,10 +119,40 @@ pub struct ResponsesWebsocketSessionNotFoundError {
 #[derive(Debug)]
 struct RetainedUpstreamWebsocketEntry<T> {
     lease_id: u64,
-    upstream_ws: T,
+    socket: RetainedUpstreamWebsocketState<T>,
     metadata: ResponsesWebsocketSessionMetadata,
     in_use: bool,
     last_used: u64,
+}
+
+#[derive(Debug)]
+enum RetainedUpstreamWebsocketState<T> {
+    Alive(T),
+    ClosedRecoverable,
+}
+
+enum ExistingAcquire<T> {
+    Lease(RetainedUpstreamWebsocketLease<T>),
+    Reconnect {
+        response_id: String,
+        lease_id: u64,
+        metadata: ResponsesWebsocketSessionMetadata,
+    },
+}
+
+enum AsyncAcquirePlan {
+    New {
+        reservation: u64,
+    },
+    NewWithMetadata {
+        reservation: u64,
+        metadata: ResponsesWebsocketSessionMetadata,
+    },
+    Reconnect {
+        response_id: String,
+        lease_id: u64,
+        metadata: ResponsesWebsocketSessionMetadata,
+    },
 }
 
 #[derive(Debug)]
@@ -187,26 +217,41 @@ where
 
     fn close_entry(state: &mut RegistryState<T>, response_id: &str) {
         if let Some(entry) = state.sessions.remove(response_id) {
-            entry.upstream_ws.close_socket();
+            if let RetainedUpstreamWebsocketState::Alive(upstream_ws) = entry.socket {
+                upstream_ws.close_socket();
+            }
         }
     }
 
-    fn evict_closed_entries(state: &mut RegistryState<T>) {
-        let closed_ids = state
-            .sessions
-            .iter()
-            .filter(|(_, entry)| !entry.in_use && entry.upstream_ws.is_socket_closed())
-            .map(|(response_id, _)| response_id.clone())
-            .collect::<Vec<_>>();
-        for response_id in closed_ids {
-            Self::close_entry(state, &response_id);
+    fn mark_entry_closed_recoverable(entry: &mut RetainedUpstreamWebsocketEntry<T>) -> bool {
+        let RetainedUpstreamWebsocketState::Alive(upstream_ws) = &entry.socket else {
+            return true;
+        };
+        if !upstream_ws.is_socket_closed() {
+            return false;
+        }
+        let old_socket = std::mem::replace(
+            &mut entry.socket,
+            RetainedUpstreamWebsocketState::ClosedRecoverable,
+        );
+        if let RetainedUpstreamWebsocketState::Alive(upstream_ws) = old_socket {
+            upstream_ws.close_socket();
+        }
+        true
+    }
+
+    fn retained_socket_state(upstream_ws: T) -> RetainedUpstreamWebsocketState<T> {
+        if upstream_ws.is_socket_closed() {
+            upstream_ws.close_socket();
+            RetainedUpstreamWebsocketState::ClosedRecoverable
+        } else {
+            RetainedUpstreamWebsocketState::Alive(upstream_ws)
         }
     }
 
     fn evict_to_capacity(
         state: &mut RegistryState<T>,
     ) -> Result<(), ResponsesWebsocketSessionCapacityError> {
-        Self::evict_closed_entries(state);
         while state.active_session_count() >= state.max_sessions {
             let idle_response_id = state
                 .sessions
@@ -222,6 +267,106 @@ where
         Ok(())
     }
 
+    fn acquire_existing(
+        state: &mut RegistryState<T>,
+        response_id: &str,
+    ) -> Result<ExistingAcquire<T>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(entry) = state.sessions.get(response_id) else {
+            tracing::debug!(response_id, "previous_response_not_found");
+            return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
+                response_id: response_id.to_string(),
+            }));
+        };
+        if entry.in_use {
+            return Err(Box::new(ResponsesWebsocketSessionConflictError {
+                response_id: response_id.to_string(),
+            }));
+        }
+
+        let tick = state.advance_tick();
+        let entry = state
+            .sessions
+            .get_mut(response_id)
+            .expect("checked retained websocket entry");
+        entry.in_use = true;
+        entry.last_used = tick;
+
+        tracing::debug!(response_id, "acquire_previous_response");
+        if Self::mark_entry_closed_recoverable(entry) {
+            tracing::debug!(response_id, recoverable = true, "retained_socket_closed");
+            return Ok(ExistingAcquire::Reconnect {
+                response_id: response_id.to_string(),
+                lease_id: entry.lease_id,
+                metadata: entry.metadata.clone(),
+            });
+        }
+
+        let RetainedUpstreamWebsocketState::Alive(upstream_ws) = &entry.socket else {
+            unreachable!("closed recoverable handled before alive lease return");
+        };
+        Ok(ExistingAcquire::Lease(RetainedUpstreamWebsocketLease {
+            response_id: Some(response_id.to_string()),
+            upstream_ws: upstream_ws.clone(),
+            metadata: entry.metadata.clone(),
+            created: false,
+            lease_id: entry.lease_id,
+        }))
+    }
+
+    fn reconnect_success(
+        &self,
+        response_id: String,
+        lease_id: u64,
+        metadata: ResponsesWebsocketSessionMetadata,
+        upstream_ws: T,
+    ) -> Result<RetainedUpstreamWebsocketLease<T>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut state = self.state.lock().expect("registry lock poisoned");
+        let tick = state.advance_tick();
+        let Some(entry) = state.sessions.get_mut(&response_id) else {
+            upstream_ws.close_socket();
+            tracing::debug!(response_id, "previous_response_not_found");
+            return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
+                response_id,
+            }));
+        };
+        if entry.lease_id != lease_id || !entry.in_use {
+            upstream_ws.close_socket();
+            tracing::debug!(response_id, "previous_response_not_found");
+            return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
+                response_id,
+            }));
+        }
+        entry.socket = RetainedUpstreamWebsocketState::Alive(upstream_ws.clone());
+        entry.metadata = metadata.clone();
+        entry.last_used = tick;
+        tracing::debug!(response_id, "reconnect_continuation_success");
+        Ok(RetainedUpstreamWebsocketLease {
+            response_id: Some(response_id),
+            upstream_ws,
+            metadata,
+            created: false,
+            lease_id,
+        })
+    }
+
+    fn reconnect_failed(
+        &self,
+        response_id: String,
+        lease_id: u64,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        let mut state = self.state.lock().expect("registry lock poisoned");
+        let remove = state
+            .sessions
+            .get(&response_id)
+            .map(|entry| entry.lease_id == lease_id)
+            .unwrap_or(false);
+        if remove {
+            Self::close_entry(&mut state, &response_id);
+        }
+        tracing::debug!(response_id, "previous_response_not_found");
+        Box::new(ResponsesWebsocketSessionNotFoundError { response_id })
+    }
+
     pub fn acquire<F>(
         &self,
         response_id: Option<&str>,
@@ -232,73 +377,68 @@ where
     {
         let normalized_response_id = Self::normalize_response_id(response_id);
 
-        let reservation = {
+        let reconnect = {
             let mut state = self.state.lock().expect("registry lock poisoned");
             if let Some(response_id) = normalized_response_id.as_deref() {
-                if let Some(entry) = state.sessions.get(response_id) {
-                    if entry.in_use {
-                        return Err(Box::new(ResponsesWebsocketSessionConflictError {
-                            response_id: response_id.to_string(),
-                        }));
-                    }
-                    if entry.upstream_ws.is_socket_closed() {
-                        Self::close_entry(&mut state, response_id);
-                        return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
-                            response_id: response_id.to_string(),
-                        }));
-                    }
-                } else {
-                    return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
-                        response_id: response_id.to_string(),
-                    }));
+                match Self::acquire_existing(&mut state, response_id)? {
+                    ExistingAcquire::Lease(lease) => return Ok(lease),
+                    ExistingAcquire::Reconnect {
+                        response_id,
+                        lease_id,
+                        metadata,
+                    } => (response_id, lease_id, metadata),
                 }
+            } else {
+                Self::evict_to_capacity(&mut state)?;
+                let reservation = state.next_lease_id();
+                state.pending_reservations.insert(reservation);
+                drop(state);
+                let upstream_ws = match create_upstream_websocket() {
+                    Ok(upstream_ws) => upstream_ws,
+                    Err(error) => {
+                        self.state
+                            .lock()
+                            .expect("registry lock poisoned")
+                            .pending_reservations
+                            .remove(&reservation);
+                        return Err(error);
+                    }
+                };
 
-                let tick = state.advance_tick();
-                let entry = state
-                    .sessions
-                    .get_mut(response_id)
-                    .expect("checked retained websocket entry");
-                entry.in_use = true;
-                entry.last_used = tick;
+                let mut state = self.state.lock().expect("registry lock poisoned");
+                state.pending_reservations.remove(&reservation);
+                state
+                    .anonymous_leases
+                    .insert(reservation, upstream_ws.clone());
                 return Ok(RetainedUpstreamWebsocketLease {
-                    response_id: Some(response_id.to_string()),
-                    upstream_ws: entry.upstream_ws.clone(),
-                    metadata: entry.metadata.clone(),
-                    created: false,
-                    lease_id: entry.lease_id,
+                    response_id: None,
+                    upstream_ws,
+                    metadata: ResponsesWebsocketSessionMetadata::initial(reservation),
+                    created: true,
+                    lease_id: reservation,
                 });
             }
-
-            Self::evict_to_capacity(&mut state)?;
-            let reservation = state.next_lease_id();
-            state.pending_reservations.insert(reservation);
-            reservation
         };
 
-        let upstream_ws = match create_upstream_websocket() {
-            Ok(upstream_ws) => upstream_ws,
-            Err(error) => {
-                self.state
-                    .lock()
-                    .expect("registry lock poisoned")
-                    .pending_reservations
-                    .remove(&reservation);
-                return Err(error);
+        tracing::debug!(
+            response_id = reconnect.0.as_str(),
+            session_id = reconnect.2.session_id.as_str(),
+            thread_id = reconnect.2.thread_id.as_str(),
+            "reconnect_continuation_attempt"
+        );
+        match create_upstream_websocket() {
+            Ok(upstream_ws) => {
+                self.reconnect_success(reconnect.0, reconnect.1, reconnect.2, upstream_ws)
             }
-        };
-
-        let mut state = self.state.lock().expect("registry lock poisoned");
-        state.pending_reservations.remove(&reservation);
-        state
-            .anonymous_leases
-            .insert(reservation, upstream_ws.clone());
-        Ok(RetainedUpstreamWebsocketLease {
-            response_id: None,
-            upstream_ws,
-            metadata: ResponsesWebsocketSessionMetadata::initial(reservation),
-            created: true,
-            lease_id: reservation,
-        })
+            Err(error) => {
+                tracing::debug!(
+                    response_id = reconnect.0.as_str(),
+                    error = %error,
+                    "reconnect_continuation_failed"
+                );
+                Err(self.reconnect_failed(reconnect.0, reconnect.1))
+            }
+        }
     }
 
     pub async fn acquire_async<F, Fut>(
@@ -312,73 +452,83 @@ where
     {
         let normalized_response_id = Self::normalize_response_id(response_id);
 
-        let reservation = {
+        let plan = {
             let mut state = self.state.lock().expect("registry lock poisoned");
             if let Some(response_id) = normalized_response_id.as_deref() {
-                if let Some(entry) = state.sessions.get(response_id) {
-                    if entry.in_use {
-                        return Err(Box::new(ResponsesWebsocketSessionConflictError {
-                            response_id: response_id.to_string(),
-                        }));
-                    }
-                    if entry.upstream_ws.is_socket_closed() {
-                        Self::close_entry(&mut state, response_id);
-                        return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
-                            response_id: response_id.to_string(),
-                        }));
-                    }
-                } else {
-                    return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
-                        response_id: response_id.to_string(),
-                    }));
+                match Self::acquire_existing(&mut state, response_id)? {
+                    ExistingAcquire::Lease(lease) => return Ok(lease),
+                    ExistingAcquire::Reconnect {
+                        response_id,
+                        lease_id,
+                        metadata,
+                    } => AsyncAcquirePlan::Reconnect {
+                        response_id,
+                        lease_id,
+                        metadata,
+                    },
                 }
-
-                let tick = state.advance_tick();
-                let entry = state
-                    .sessions
-                    .get_mut(response_id)
-                    .expect("checked retained websocket entry");
-                entry.in_use = true;
-                entry.last_used = tick;
-                return Ok(RetainedUpstreamWebsocketLease {
-                    response_id: Some(response_id.to_string()),
-                    upstream_ws: entry.upstream_ws.clone(),
-                    metadata: entry.metadata.clone(),
-                    created: false,
-                    lease_id: entry.lease_id,
-                });
-            }
-
-            Self::evict_to_capacity(&mut state)?;
-            let reservation = state.next_lease_id();
-            state.pending_reservations.insert(reservation);
-            reservation
-        };
-
-        let upstream_ws = match create_upstream_websocket().await {
-            Ok(upstream_ws) => upstream_ws,
-            Err(error) => {
-                self.state
-                    .lock()
-                    .expect("registry lock poisoned")
-                    .pending_reservations
-                    .remove(&reservation);
-                return Err(error);
+            } else {
+                Self::evict_to_capacity(&mut state)?;
+                let reservation = state.next_lease_id();
+                state.pending_reservations.insert(reservation);
+                AsyncAcquirePlan::New { reservation }
             }
         };
 
-        let mut state = self.state.lock().expect("registry lock poisoned");
-        state.pending_reservations.remove(&reservation);
-        state
-            .anonymous_leases
-            .insert(reservation, upstream_ws.clone());
-        Ok(RetainedUpstreamWebsocketLease {
-            response_id: None,
-            upstream_ws,
-            metadata: ResponsesWebsocketSessionMetadata::initial(reservation),
-            created: true,
-            lease_id: reservation,
-        })
+        match plan {
+            AsyncAcquirePlan::New { reservation } => {
+                let upstream_ws = match create_upstream_websocket().await {
+                    Ok(upstream_ws) => upstream_ws,
+                    Err(error) => {
+                        self.state
+                            .lock()
+                            .expect("registry lock poisoned")
+                            .pending_reservations
+                            .remove(&reservation);
+                        return Err(error);
+                    }
+                };
+
+                let mut state = self.state.lock().expect("registry lock poisoned");
+                state.pending_reservations.remove(&reservation);
+                state
+                    .anonymous_leases
+                    .insert(reservation, upstream_ws.clone());
+                Ok(RetainedUpstreamWebsocketLease {
+                    response_id: None,
+                    upstream_ws,
+                    metadata: ResponsesWebsocketSessionMetadata::initial(reservation),
+                    created: true,
+                    lease_id: reservation,
+                })
+            }
+            AsyncAcquirePlan::Reconnect {
+                response_id,
+                lease_id,
+                metadata,
+            } => {
+                tracing::debug!(
+                    response_id = response_id.as_str(),
+                    session_id = metadata.session_id.as_str(),
+                    thread_id = metadata.thread_id.as_str(),
+                    "reconnect_continuation_attempt"
+                );
+                match create_upstream_websocket().await {
+                    Ok(upstream_ws) => {
+                        self.reconnect_success(response_id, lease_id, metadata, upstream_ws)
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            response_id = response_id.as_str(),
+                            error = %error,
+                            "reconnect_continuation_failed"
+                        );
+                        Err(self.reconnect_failed(response_id, lease_id))
+                    }
+                }
+            }
+            AsyncAcquirePlan::NewWithMetadata { .. } => unreachable!("metadata plan unused here"),
+        }
     }
 
     pub async fn acquire_async_with_metadata<F, Fut>(
@@ -392,76 +542,90 @@ where
     {
         let normalized_response_id = Self::normalize_response_id(response_id);
 
-        let (reservation, metadata) = {
+        let plan = {
             let mut state = self.state.lock().expect("registry lock poisoned");
             if let Some(response_id) = normalized_response_id.as_deref() {
-                if let Some(entry) = state.sessions.get(response_id) {
-                    if entry.in_use {
-                        return Err(Box::new(ResponsesWebsocketSessionConflictError {
-                            response_id: response_id.to_string(),
-                        }));
-                    }
-                    if entry.upstream_ws.is_socket_closed() {
-                        Self::close_entry(&mut state, response_id);
-                        return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
-                            response_id: response_id.to_string(),
-                        }));
-                    }
-                } else {
-                    return Err(Box::new(ResponsesWebsocketSessionNotFoundError {
-                        response_id: response_id.to_string(),
-                    }));
+                match Self::acquire_existing(&mut state, response_id)? {
+                    ExistingAcquire::Lease(lease) => return Ok(lease),
+                    ExistingAcquire::Reconnect {
+                        response_id,
+                        lease_id,
+                        metadata,
+                    } => AsyncAcquirePlan::Reconnect {
+                        response_id,
+                        lease_id,
+                        metadata,
+                    },
                 }
-
-                let tick = state.advance_tick();
-                let entry = state
-                    .sessions
-                    .get_mut(response_id)
-                    .expect("checked retained websocket entry");
-                entry.in_use = true;
-                entry.last_used = tick;
-                return Ok(RetainedUpstreamWebsocketLease {
-                    response_id: Some(response_id.to_string()),
-                    upstream_ws: entry.upstream_ws.clone(),
-                    metadata: entry.metadata.clone(),
-                    created: false,
-                    lease_id: entry.lease_id,
-                });
+            } else {
+                Self::evict_to_capacity(&mut state)?;
+                let reservation = state.next_lease_id();
+                state.pending_reservations.insert(reservation);
+                let metadata = ResponsesWebsocketSessionMetadata::initial(reservation);
+                AsyncAcquirePlan::NewWithMetadata {
+                    reservation,
+                    metadata,
+                }
             }
+        };
 
-            Self::evict_to_capacity(&mut state)?;
-            let reservation = state.next_lease_id();
-            state.pending_reservations.insert(reservation);
-            (
+        match plan {
+            AsyncAcquirePlan::NewWithMetadata {
                 reservation,
-                ResponsesWebsocketSessionMetadata::initial(reservation),
-            )
-        };
+                metadata,
+            } => {
+                let upstream_ws = match create_upstream_websocket(metadata.clone()).await {
+                    Ok(upstream_ws) => upstream_ws,
+                    Err(error) => {
+                        self.state
+                            .lock()
+                            .expect("registry lock poisoned")
+                            .pending_reservations
+                            .remove(&reservation);
+                        return Err(error);
+                    }
+                };
 
-        let upstream_ws = match create_upstream_websocket(metadata.clone()).await {
-            Ok(upstream_ws) => upstream_ws,
-            Err(error) => {
-                self.state
-                    .lock()
-                    .expect("registry lock poisoned")
-                    .pending_reservations
-                    .remove(&reservation);
-                return Err(error);
+                let mut state = self.state.lock().expect("registry lock poisoned");
+                state.pending_reservations.remove(&reservation);
+                state
+                    .anonymous_leases
+                    .insert(reservation, upstream_ws.clone());
+                Ok(RetainedUpstreamWebsocketLease {
+                    response_id: None,
+                    upstream_ws,
+                    metadata,
+                    created: true,
+                    lease_id: reservation,
+                })
             }
-        };
-
-        let mut state = self.state.lock().expect("registry lock poisoned");
-        state.pending_reservations.remove(&reservation);
-        state
-            .anonymous_leases
-            .insert(reservation, upstream_ws.clone());
-        Ok(RetainedUpstreamWebsocketLease {
-            response_id: None,
-            upstream_ws,
-            metadata,
-            created: true,
-            lease_id: reservation,
-        })
+            AsyncAcquirePlan::Reconnect {
+                response_id,
+                lease_id,
+                metadata,
+            } => {
+                tracing::debug!(
+                    response_id = response_id.as_str(),
+                    session_id = metadata.session_id.as_str(),
+                    thread_id = metadata.thread_id.as_str(),
+                    "reconnect_continuation_attempt"
+                );
+                match create_upstream_websocket(metadata.clone()).await {
+                    Ok(upstream_ws) => {
+                        self.reconnect_success(response_id, lease_id, metadata, upstream_ws)
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            response_id = response_id.as_str(),
+                            error = %error,
+                            "reconnect_continuation_failed"
+                        );
+                        Err(self.reconnect_failed(response_id, lease_id))
+                    }
+                }
+            }
+            AsyncAcquirePlan::New { .. } => unreachable!("non-metadata plan unused here"),
+        }
     }
 
     pub fn release(
@@ -473,26 +637,37 @@ where
         let retained_response_id =
             Self::normalize_response_id(response_id).or_else(|| lease.response_id.clone());
         let mut state = self.state.lock().expect("registry lock poisoned");
+        tracing::debug!(
+            retain,
+            response_id = retained_response_id.as_deref(),
+            "lease_release"
+        );
 
         if let Some(upstream_ws) = state.anonymous_leases.remove(&lease.lease_id) {
             if retain {
                 if let Some(response_id) = retained_response_id {
-                    if !upstream_ws.is_socket_closed() {
-                        let last_used = state.advance_tick();
-                        let mut metadata = lease.metadata;
-                        metadata.last_response_id = Some(response_id.clone());
-                        state.sessions.insert(
+                    let last_used = state.advance_tick();
+                    let mut metadata = lease.metadata;
+                    metadata.last_response_id = Some(response_id.clone());
+                    let socket = Self::retained_socket_state(upstream_ws);
+                    if matches!(socket, RetainedUpstreamWebsocketState::ClosedRecoverable) {
+                        tracing::debug!(
                             response_id,
-                            RetainedUpstreamWebsocketEntry {
-                                lease_id: lease.lease_id,
-                                upstream_ws,
-                                metadata,
-                                in_use: false,
-                                last_used,
-                            },
+                            recoverable = true,
+                            "registry_entry_mark_closed"
                         );
-                        return;
                     }
+                    state.sessions.insert(
+                        response_id,
+                        RetainedUpstreamWebsocketEntry {
+                            lease_id: lease.lease_id,
+                            socket,
+                            metadata,
+                            in_use: false,
+                            last_used,
+                        },
+                    );
+                    return;
                 }
             }
             upstream_ws.close_socket();
@@ -523,26 +698,41 @@ where
 
         if retain {
             if let Some(response_id) = retained_response_id {
-                if !entry.upstream_ws.is_socket_closed() {
-                    let last_used = state.advance_tick();
-                    let mut metadata = entry.metadata;
-                    metadata.last_response_id = Some(response_id.clone());
-                    state.sessions.insert(
+                let last_used = state.advance_tick();
+                let mut metadata = entry.metadata;
+                metadata.last_response_id = Some(response_id.clone());
+                let socket = match entry.socket {
+                    RetainedUpstreamWebsocketState::Alive(upstream_ws) => {
+                        Self::retained_socket_state(upstream_ws)
+                    }
+                    RetainedUpstreamWebsocketState::ClosedRecoverable => {
+                        RetainedUpstreamWebsocketState::ClosedRecoverable
+                    }
+                };
+                if matches!(socket, RetainedUpstreamWebsocketState::ClosedRecoverable) {
+                    tracing::debug!(
                         response_id,
-                        RetainedUpstreamWebsocketEntry {
-                            lease_id: entry.lease_id,
-                            upstream_ws: entry.upstream_ws,
-                            metadata,
-                            in_use: false,
-                            last_used,
-                        },
+                        recoverable = true,
+                        "registry_entry_mark_closed"
                     );
-                    return;
                 }
+                state.sessions.insert(
+                    response_id,
+                    RetainedUpstreamWebsocketEntry {
+                        lease_id: entry.lease_id,
+                        socket,
+                        metadata,
+                        in_use: false,
+                        last_used,
+                    },
+                );
+                return;
             }
         }
 
-        entry.upstream_ws.close_socket();
+        if let RetainedUpstreamWebsocketState::Alive(upstream_ws) = entry.socket {
+            upstream_ws.close_socket();
+        }
     }
 }
 
