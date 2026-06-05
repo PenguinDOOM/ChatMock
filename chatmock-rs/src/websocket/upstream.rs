@@ -4,20 +4,21 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
 };
 
 use axum::{body::Body, response::Response};
-use futures_util::{SinkExt, StreamExt, stream::BoxStream};
+use futures_util::{stream::BoxStream, SinkExt, StreamExt};
 use reqwest::StatusCode;
-use serde_json::{Value, json};
-use tokio::sync::{Notify, mpsc};
-use tokio::time::{Duration, Instant, interval, timeout};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Notify};
+use tokio::time::{interval, timeout, Duration, Instant};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest, protocol::frame::coding::CloseCode},
+    connect_async,
+    tungstenite::{client::IntoClientRequest, protocol::frame::coding::CloseCode, Message},
+    MaybeTlsStream, WebSocketStream,
 };
 
 use crate::{
@@ -25,10 +26,10 @@ use crate::{
     jobs::JobManager,
     routes::json_response,
     upstream::{
-        UpstreamResponse, build_upstream_websocket_headers, refresh_chatgpt_tokens,
-        upstream_websocket_url,
+        build_upstream_websocket_headers, refresh_chatgpt_tokens, upstream_websocket_url,
+        UpstreamResponse,
     },
-    upstream_errors::{UpstreamErrorContext, build_upstream_error},
+    upstream_errors::{build_upstream_error, UpstreamErrorContext},
     websocket::registry::{
         ResponsesWebsocketSessionCapacityError, ResponsesWebsocketSessionConflictError,
         ResponsesWebsocketSessionNotFoundError, RetainedUpstreamWebsocket,
@@ -159,6 +160,7 @@ enum ScriptedUpstreamReceiveStep {
     Text(String),
     Wait(Arc<Notify>),
     Close(UpstreamCloseMetadata),
+    Error(String),
 }
 
 impl ScriptedUpstreamReceive {
@@ -179,6 +181,12 @@ impl ScriptedUpstreamReceive {
     pub fn close(code: Option<CloseCode>, reason: Option<String>) -> Self {
         Self {
             step: ScriptedUpstreamReceiveStep::Close(UpstreamCloseMetadata { code, reason }),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            step: ScriptedUpstreamReceiveStep::Error(message.into()),
         }
     }
 }
@@ -308,6 +316,11 @@ impl SharedUpstreamWebsocket {
                         state.close_metadata = Some(metadata);
                         return Ok(None);
                     }
+                    Some(ScriptedUpstreamReceiveStep::Error(message)) => {
+                        let mut state = state.lock().expect("scripted websocket lock");
+                        state.closed = true;
+                        return Err(std::io::Error::other(message).into());
+                    }
                     None => return Ok(None),
                 }
             },
@@ -317,7 +330,22 @@ impl SharedUpstreamWebsocket {
                     state.closed.store(true, Ordering::SeqCst);
                     return Ok(None);
                 };
-                let frame = stream.next().await.transpose()?;
+                let frame = match stream.next().await {
+                    Some(Ok(frame)) => Some(frame),
+                    Some(Err(error)) => {
+                        state.closed.store(true, Ordering::SeqCst);
+                        *state
+                            .close_metadata
+                            .lock()
+                            .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
+                            code: None,
+                            reason: Some(error.to_string()),
+                        });
+                        *guard = None;
+                        return Err(error.into());
+                    }
+                    None => None,
+                };
                 match frame {
                     Some(Message::Text(text)) => return Ok(Some(text.to_string())),
                     Some(Message::Binary(bytes)) => {
@@ -573,7 +601,7 @@ pub async fn send_stateful_responses_create_request(
 
     let outbound = serde_json::to_string(&websocket_request_payload(payload))
         .expect("responses websocket payload json");
-    if let Err(error) = guard.lease().upstream_ws.send_text(outbound).await {
+    if let Err(error) = guard.lease().upstream_ws.send_text(outbound.clone()).await {
         tracing::warn!(route = ROUTE, error = %error, "upstream_send_failed");
         return Err(websocket_gateway_error(
             "Upstream websocket request failed",
@@ -586,26 +614,67 @@ pub async fn send_stateful_responses_create_request(
     let mut retained_response_id = None;
     let mut pending_internal_outputs = Vec::new();
     let mut retain = false;
+    let mut received_any_event = false;
+    let mut retry_used = false;
     loop {
         let message = match guard.lease().upstream_ws.recv_text().await {
-            Ok(message) => message,
+            Ok(Some(message)) => {
+                if retry_used && !received_any_event {
+                    trace_upstream_event_after_retry(ROUTE, &message);
+                }
+                received_any_event = true;
+                message
+            }
+            Ok(None) => {
+                if should_retry_initial_receive(&guard, received_any_event, retry_used) {
+                    log_upstream_socket_closed(ROUTE, &guard.lease().upstream_ws);
+                    retry_used = true;
+                    guard = reconnect_and_resend_stateful_request(
+                        ROUTE,
+                        connector,
+                        Arc::clone(&registry),
+                        guard,
+                        &outbound,
+                    )
+                    .await?;
+                    received_any_event = false;
+                    continue;
+                }
+                log_upstream_socket_closed(ROUTE, &guard.lease().upstream_ws);
+                tracing::debug!(
+                    route = ROUTE,
+                    reason = "upstream_socket_closed",
+                    "loop_break"
+                );
+                break;
+            }
             Err(error) => {
-                tracing::warn!(route = ROUTE, error = %error, "upstream_receive_failed");
+                let before_first_event = !received_any_event;
+                tracing::warn!(
+                    route = ROUTE,
+                    before_first_event,
+                    retry_used,
+                    error = %error,
+                    "upstream_receive_failed"
+                );
+                if should_retry_initial_receive(&guard, received_any_event, retry_used) {
+                    retry_used = true;
+                    guard = reconnect_and_resend_stateful_request(
+                        ROUTE,
+                        connector,
+                        Arc::clone(&registry),
+                        guard,
+                        &outbound,
+                    )
+                    .await?;
+                    received_any_event = false;
+                    continue;
+                }
                 return Err(websocket_gateway_error(
                     "Upstream websocket receive failed",
                     error,
                 ));
             }
-        };
-
-        let Some(message) = message else {
-            log_upstream_socket_closed(ROUTE, &guard.lease().upstream_ws);
-            tracing::debug!(
-                route = ROUTE,
-                reason = "upstream_socket_closed",
-                "loop_break"
-            );
-            break;
         };
 
         trace_upstream_event(ROUTE, &message);
@@ -727,7 +796,7 @@ pub async fn send_stateful_responses_create_stream(
 
     let outbound = serde_json::to_string(&websocket_request_payload(payload))
         .expect("responses websocket payload json");
-    if let Err(error) = guard.lease().upstream_ws.send_text(outbound).await {
+    if let Err(error) = guard.lease().upstream_ws.send_text(outbound.clone()).await {
         tracing::warn!(route = ROUTE, error = %error, "upstream_send_failed");
         drop(guard);
         return Err(websocket_gateway_error(
@@ -738,12 +807,22 @@ pub async fn send_stateful_responses_create_stream(
 
     Ok(crate::routes::event_streaming_response(
         StatusCode::OK,
-        stateful_sse_stream(guard, stream_config, job_manager),
+        stateful_sse_stream(
+            connector.clone(),
+            registry,
+            guard,
+            outbound,
+            stream_config,
+            job_manager,
+        ),
     ))
 }
 
 fn stateful_sse_stream(
+    connector: ResponsesWebsocketConnector,
+    registry: Arc<RetainedUpstreamWebsocketRegistry<SharedUpstreamWebsocket>>,
     mut guard: RetainedUpstreamWebsocketLeaseGuard<SharedUpstreamWebsocket>,
+    outbound: String,
     config: StatefulResponsesWebsocketStreamConfig,
     job_manager: Option<Arc<JobManager>>,
 ) -> BoxStream<'static, Result<Vec<u8>, Infallible>> {
@@ -753,6 +832,8 @@ fn stateful_sse_stream(
         let mut pending_internal_outputs = Vec::new();
         let mut downstream_open = true;
         let mut disconnect_deadline = None;
+        let mut received_any_event = false;
+        let mut retry_used = false;
         let mut keep_alive = interval(config.keep_alive_interval);
         keep_alive.tick().await;
         loop {
@@ -799,8 +880,37 @@ fn stateful_sse_stream(
                 }
             };
             let message = match message {
-                Ok(Some(message)) => message,
+                Ok(Some(message)) => {
+                    if retry_used && !received_any_event {
+                        trace_upstream_event_after_retry("stateful_sse", &message);
+                    }
+                    received_any_event = true;
+                    message
+                }
                 Ok(None) => {
+                    if should_retry_initial_receive(&guard, received_any_event, retry_used) {
+                        log_upstream_socket_closed("stateful_sse", &guard.lease().upstream_ws);
+                        retry_used = true;
+                        match reconnect_and_resend_stateful_request(
+                            "stateful_sse",
+                            &connector,
+                            Arc::clone(&registry),
+                            guard,
+                            &outbound,
+                        )
+                        .await
+                        {
+                            Ok(next_guard) => {
+                                guard = next_guard;
+                                received_any_event = false;
+                                continue;
+                            }
+                            Err(error_response) => {
+                                send_sse_error_response(&sender, error_response).await;
+                                break;
+                            }
+                        }
+                    }
                     log_upstream_socket_closed("stateful_sse", &guard.lease().upstream_ws);
                     tracing::debug!(
                         route = "stateful_sse",
@@ -810,7 +920,36 @@ fn stateful_sse_stream(
                     break;
                 }
                 Err(error) => {
-                    tracing::warn!(route = "stateful_sse", error = %error, "upstream_receive_failed");
+                    let before_first_event = !received_any_event;
+                    tracing::warn!(
+                        route = "stateful_sse",
+                        before_first_event,
+                        retry_used,
+                        error = %error,
+                        "upstream_receive_failed"
+                    );
+                    if should_retry_initial_receive(&guard, received_any_event, retry_used) {
+                        retry_used = true;
+                        match reconnect_and_resend_stateful_request(
+                            "stateful_sse",
+                            &connector,
+                            Arc::clone(&registry),
+                            guard,
+                            &outbound,
+                        )
+                        .await
+                        {
+                            Ok(next_guard) => {
+                                guard = next_guard;
+                                received_any_event = false;
+                                continue;
+                            }
+                            Err(error_response) => {
+                                send_sse_error_response(&sender, error_response).await;
+                                break;
+                            }
+                        }
+                    }
                     tracing::debug!(
                         route = "stateful_sse",
                         reason = "upstream_receive_failed",
@@ -929,6 +1068,98 @@ fn stateful_sse_stream(
     Box::pin(tokio_stream_from_receiver(receiver))
 }
 
+fn should_retry_initial_receive(
+    guard: &RetainedUpstreamWebsocketLeaseGuard<SharedUpstreamWebsocket>,
+    received_any_event: bool,
+    retry_used: bool,
+) -> bool {
+    !retry_used
+        && !received_any_event
+        && !guard.lease().created
+        && guard.lease().response_id.is_some()
+}
+
+async fn reconnect_and_resend_stateful_request(
+    route: &str,
+    connector: &ResponsesWebsocketConnector,
+    registry: Arc<RetainedUpstreamWebsocketRegistry<SharedUpstreamWebsocket>>,
+    guard: RetainedUpstreamWebsocketLeaseGuard<SharedUpstreamWebsocket>,
+    outbound: &str,
+) -> Result<RetainedUpstreamWebsocketLeaseGuard<SharedUpstreamWebsocket>, Response> {
+    let response_id = guard
+        .lease()
+        .response_id
+        .clone()
+        .expect("retry requires retained response id");
+    tracing::debug!(
+        route,
+        response_id = response_id.as_str(),
+        "retain_original_for_reconnect"
+    );
+    guard.retain_original_response_id();
+
+    let lease = registry
+        .acquire_async_with_metadata(Some(response_id.as_str()), |metadata| async move {
+            let context = ResponsesWebsocketConnectContext {
+                session_id: metadata.session_id,
+                thread_id: metadata.thread_id,
+                window_generation: metadata.window_generation,
+                turn_state: metadata.turn_state,
+            };
+            connector.connect(context).await
+        })
+        .await
+        .map_err(websocket_registry_error)?;
+    let mut guard = RetainedUpstreamWebsocketLeaseGuard::new(Arc::clone(&registry), lease);
+    guard.set_turn_state(guard.lease().upstream_ws.upgrade_turn_state());
+    guard
+        .lease()
+        .upstream_ws
+        .send_text(outbound.to_string())
+        .await
+        .map_err(|error| {
+            tracing::warn!(route, error = %error, "upstream_send_failed");
+            websocket_gateway_error("Upstream websocket request failed", error)
+        })?;
+    tracing::debug!(
+        route,
+        previous_response_id = response_id.as_str(),
+        "upstream_request_resent"
+    );
+    Ok(guard)
+}
+
+async fn send_sse_error_response(
+    sender: &mpsc::Sender<Result<Vec<u8>, Infallible>>,
+    response: Response,
+) {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let error = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("error")
+                .filter(|value| value.is_object())
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "message": status
+                    .canonical_reason()
+                    .unwrap_or("Upstream websocket request failed")
+            })
+        });
+    let event = json!({
+        "type": "error",
+        "status_code": status.as_u16(),
+        "error": error,
+    });
+    let _ = sender.send(Ok(sse_frame(&event.to_string()))).await;
+}
+
 fn push_sse_message(body: &mut String, message: &str) {
     body.push_str("data: ");
     body.push_str(message);
@@ -962,11 +1193,22 @@ fn trace_upstream_event(route: &str, message: &str) {
     );
 }
 
+fn trace_upstream_event_after_retry(route: &str, message: &str) {
+    let event_type = websocket_message_event_type(message);
+    let response_id = websocket_message_response_id(message);
+    tracing::trace!(
+        route,
+        event_type = event_type.as_deref(),
+        response_id = response_id.as_deref(),
+        "upstream_event_received_after_retry"
+    );
+}
+
 fn log_upstream_socket_closed(route: &str, socket: &SharedUpstreamWebsocket) {
     let close = socket.close_metadata();
     tracing::warn!(
         route,
-        code = ?close.as_ref().and_then(|metadata| metadata.code.clone()),
+        code = ?close.as_ref().and_then(|metadata| metadata.code),
         reason = ?close.as_ref().and_then(|metadata| metadata.reason.as_deref()),
         "upstream_socket_closed"
     );

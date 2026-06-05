@@ -472,21 +472,15 @@ async fn maybe_intercept_chatmock_job_tool_call(
     state: &crate::server::AppState,
     message: &str,
 ) -> Option<PendingInternalToolOutput> {
-    let Some(event) = serde_json::from_str::<Value>(message).ok() else {
-        return None;
-    };
+    let event = serde_json::from_str::<Value>(message).ok()?;
     if event.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
         return None;
     }
-    let Some(item) = event.get("item").and_then(Value::as_object) else {
-        return None;
-    };
+    let item = event.get("item").and_then(Value::as_object)?;
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
         return None;
     }
-    let Some(name) = item.get("name").and_then(Value::as_str) else {
-        return None;
-    };
+    let name = item.get("name").and_then(Value::as_str)?;
     if !name.starts_with("chatmock_") {
         return None;
     }

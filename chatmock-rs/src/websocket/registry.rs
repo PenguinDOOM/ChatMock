@@ -80,6 +80,13 @@ where
         self.release_inner();
     }
 
+    pub fn retain_original_response_id(mut self) {
+        if let Some(response_id) = self.lease().response_id.clone() {
+            self.retained_response_id = Some(response_id);
+        }
+        self.release_inner();
+    }
+
     fn release_inner(&mut self) {
         if let Some(lease) = self.lease.take() {
             let response_id = self.retained_response_id.as_deref();

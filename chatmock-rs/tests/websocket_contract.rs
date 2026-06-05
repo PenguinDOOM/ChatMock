@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chatmock_rs::RuntimeConfig;
 use chatmock_rs::server;
 use chatmock_rs::websocket::registry::{
     ResponsesWebsocketSessionCapacityError, ResponsesWebsocketSessionConflictError,
@@ -11,14 +10,15 @@ use chatmock_rs::websocket::registry::{
 use chatmock_rs::websocket::upstream::{
     ResponsesWebsocketConnectContext, ScriptedUpstreamReceive, SharedUpstreamWebsocket,
 };
+use chatmock_rs::RuntimeConfig;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio::task::yield_now;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message, protocol::frame::coding::CloseCode},
+    tungstenite::{protocol::frame::coding::CloseCode, Message},
 };
 
 #[derive(Debug)]
@@ -264,11 +264,9 @@ fn registry_rejects_new_conversation_when_all_capacity_is_in_use() {
     let error = registry
         .acquire(None, || Ok(make_socket()))
         .expect_err("capacity should fail");
-    assert!(
-        error
-            .downcast_ref::<ResponsesWebsocketSessionCapacityError>()
-            .is_some()
-    );
+    assert!(error
+        .downcast_ref::<ResponsesWebsocketSessionCapacityError>()
+        .is_some());
 
     registry.release(first, false, None);
     registry.release(second, false, None);
@@ -330,11 +328,9 @@ async fn registry_reconnect_failure_removes_closed_completed_marker() {
     let error = registry
         .acquire(Some("resp_fixed_1"), || Ok(make_socket()))
         .expect_err("failed reconnect should remove marker");
-    assert!(
-        error
-            .downcast_ref::<ResponsesWebsocketSessionNotFoundError>()
-            .is_some()
-    );
+    assert!(error
+        .downcast_ref::<ResponsesWebsocketSessionNotFoundError>()
+        .is_some());
 }
 
 #[tokio::test]
@@ -456,31 +452,25 @@ async fn responses_route_intercepts_chatmock_job_tool_calls() {
     let sent_messages = scripted_socket.scripted_sent_messages().await;
     assert_eq!(sent_messages.len(), 2);
     let first_outbound: Value = serde_json::from_str(&sent_messages[0]).expect("first outbound");
-    assert!(
-        first_outbound["tools"]
-            .as_array()
-            .expect("tools")
-            .iter()
-            .any(|tool| tool["name"] == "chatmock_start_job")
-    );
-    assert!(
-        first_outbound["instructions"]
-            .as_str()
-            .expect("instructions")
-            .contains("chatmock_start_job")
-    );
+    assert!(first_outbound["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .any(|tool| tool["name"] == "chatmock_start_job"));
+    assert!(first_outbound["instructions"]
+        .as_str()
+        .expect("instructions")
+        .contains("chatmock_start_job"));
 
     let follow_up: Value = serde_json::from_str(&sent_messages[1]).expect("follow-up outbound");
     assert_eq!(follow_up["type"], "response.create");
     assert_eq!(follow_up["previous_response_id"], "resp_tool_turn");
     assert_eq!(follow_up["input"][0]["type"], "function_call_output");
     assert_eq!(follow_up["input"][0]["call_id"], "call_chatmock_poll");
-    assert!(
-        follow_up["input"][0]["output"]
-            .as_str()
-            .expect("tool output")
-            .contains("Job not found")
-    );
+    assert!(follow_up["input"][0]["output"]
+        .as_str()
+        .expect("tool output")
+        .contains("Job not found"));
 }
 
 #[tokio::test]
@@ -972,6 +962,181 @@ async fn responses_route_reconnects_closed_completed_marker_for_previous_respons
 }
 
 #[tokio::test]
+async fn responses_route_reconnects_when_retained_websocket_fails_before_first_event() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let connect_contexts = Arc::new(Mutex::new(Vec::<ResponsesWebsocketConnectContext>::new()));
+    let first_socket = SharedUpstreamWebsocket::scripted_with_turn_state(
+        vec![
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.created",
+                "response": {"id": "resp_ws_idle_1", "object": "response", "status": "in_progress"}
+            })),
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.completed",
+                "response": {"id": "resp_ws_idle_1", "object": "response", "status": "completed", "output": []}
+            })),
+            ScriptedUpstreamReceive::error("idle websocket reset"),
+        ],
+        "turn-state-idle-1",
+    );
+    let second_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_ws_idle_2", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_idle_2", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let first_socket_for_connector = first_socket.clone();
+    let second_socket_for_connector = second_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+    let connect_contexts_for_connector = Arc::clone(&connect_contexts);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |context| {
+            let first_socket = first_socket_for_connector.clone();
+            let second_socket = second_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            let connect_contexts = Arc::clone(&connect_contexts_for_connector);
+            Box::pin(async move {
+                connect_contexts
+                    .lock()
+                    .expect("lock contexts")
+                    .push(context);
+                match connect_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(first_socket),
+                    1 => Ok(second_socket),
+                    _ => Err(std::io::Error::other("unexpected websocket connect").into()),
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+
+    let second_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_ws_idle_1"
+        }))
+        .send()
+        .await
+        .expect("second request should succeed");
+    assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+    let second_body: Value = second_response.json().await.expect("second json body");
+    assert_eq!(second_body["id"], "resp_ws_idle_2");
+    assert!(first_socket.is_socket_closed());
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+
+    {
+        let contexts = connect_contexts.lock().expect("lock contexts");
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[1].session_id, contexts[0].session_id);
+        assert_eq!(contexts[1].thread_id, contexts[0].thread_id);
+        assert_eq!(contexts[1].window_generation, 1);
+        assert_eq!(contexts[1].turn_state.as_deref(), Some("turn-state-idle-1"));
+    }
+
+    let first_sent = first_socket.scripted_sent_messages().await;
+    let second_sent = second_socket.scripted_sent_messages().await;
+    assert_eq!(first_sent.len(), 2);
+    assert_eq!(second_sent.len(), 1);
+    let failed_outbound: Value = serde_json::from_str(&first_sent[1]).expect("failed outbound");
+    let resent_outbound: Value = serde_json::from_str(&second_sent[0]).expect("resent outbound");
+    assert_eq!(failed_outbound, resent_outbound);
+    assert_eq!(resent_outbound["previous_response_id"], "resp_ws_idle_1");
+}
+
+#[tokio::test]
+async fn responses_route_does_not_retry_after_receiving_an_event() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let scripted_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_ws_partial_1", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_ws_partial_1", "object": "response", "status": "completed", "output": []}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_ws_partial_2", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::error("mid response reset"),
+    ]);
+    let scripted_socket_for_connector = scripted_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |_context| {
+            let socket = scripted_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            Box::pin(async move {
+                if connect_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(socket)
+                } else {
+                    Err(std::io::Error::other("unexpected reconnect").into())
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+
+    let second_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_ws_partial_1"
+        }))
+        .send()
+        .await
+        .expect("second request should complete");
+    assert_eq!(second_response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+    let sent_messages = scripted_socket.scripted_sent_messages().await;
+    assert_eq!(sent_messages.len(), 2);
+}
+
+#[tokio::test]
 async fn responses_route_returns_previous_response_not_found_when_reconnect_fails() {
     let connect_calls = Arc::new(AtomicUsize::new(0));
     let first_socket = SharedUpstreamWebsocket::scripted(vec![
@@ -1395,6 +1560,125 @@ async fn responses_route_stream_reconnects_closed_completed_marker_for_previous_
 }
 
 #[tokio::test]
+async fn responses_route_stream_reconnects_when_retained_websocket_fails_before_first_event() {
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let connect_contexts = Arc::new(Mutex::new(Vec::<ResponsesWebsocketConnectContext>::new()));
+    let first_socket = SharedUpstreamWebsocket::scripted_with_turn_state(
+        vec![
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.created",
+                "response": {"id": "resp_stream_idle_1", "object": "response", "status": "in_progress"}
+            })),
+            ScriptedUpstreamReceive::text(json!({
+                "type": "response.completed",
+                "response": {"id": "resp_stream_idle_1", "object": "response", "status": "completed", "output": []}
+            })),
+            ScriptedUpstreamReceive::error("idle websocket reset"),
+        ],
+        "turn-state-stream-idle-1",
+    );
+    let second_socket = SharedUpstreamWebsocket::scripted(vec![
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.created",
+            "response": {"id": "resp_stream_idle_2", "object": "response", "status": "in_progress"}
+        })),
+        ScriptedUpstreamReceive::text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_stream_idle_2", "object": "response", "status": "completed", "output": []}
+        })),
+    ]);
+    let first_socket_for_connector = first_socket.clone();
+    let second_socket_for_connector = second_socket.clone();
+    let connect_calls_for_connector = Arc::clone(&connect_calls);
+    let connect_contexts_for_connector = Arc::clone(&connect_contexts);
+
+    let server = server::spawn_server_with_websocket_connector(
+        RuntimeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            responses_websocket_upstream: true,
+            responses_websocket_upstream_stateful: true,
+            ..RuntimeConfig::default()
+        },
+        Arc::new(move |context| {
+            let first_socket = first_socket_for_connector.clone();
+            let second_socket = second_socket_for_connector.clone();
+            let connect_calls = Arc::clone(&connect_calls_for_connector);
+            let connect_contexts = Arc::clone(&connect_contexts_for_connector);
+            Box::pin(async move {
+                connect_contexts
+                    .lock()
+                    .expect("lock contexts")
+                    .push(context);
+                match connect_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(first_socket),
+                    1 => Ok(second_socket),
+                    _ => Err(std::io::Error::other("unexpected websocket connect").into()),
+                }
+            })
+        }),
+    )
+    .await
+    .expect("server should start");
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first_body = first_response.text().await.expect("first stream body");
+    assert!(first_body.contains("resp_stream_idle_1"));
+
+    let second_response = client
+        .post(format!("{}/v1/responses", server.base_url()))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "follow up",
+            "previous_response_id": "resp_stream_idle_1",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("second request should succeed");
+    assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+    let second_body = second_response.text().await.expect("second stream body");
+    assert!(second_body.contains("resp_stream_idle_2"));
+    assert!(first_socket.is_socket_closed());
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+
+    {
+        let contexts = connect_contexts.lock().expect("lock contexts");
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[1].session_id, contexts[0].session_id);
+        assert_eq!(contexts[1].thread_id, contexts[0].thread_id);
+        assert_eq!(contexts[1].window_generation, 1);
+        assert_eq!(
+            contexts[1].turn_state.as_deref(),
+            Some("turn-state-stream-idle-1")
+        );
+    }
+
+    let first_sent = first_socket.scripted_sent_messages().await;
+    let second_sent = second_socket.scripted_sent_messages().await;
+    assert_eq!(first_sent.len(), 2);
+    assert_eq!(second_sent.len(), 1);
+    let failed_outbound: Value = serde_json::from_str(&first_sent[1]).expect("failed outbound");
+    let resent_outbound: Value = serde_json::from_str(&second_sent[0]).expect("resent outbound");
+    assert_eq!(failed_outbound, resent_outbound);
+    assert_eq!(
+        resent_outbound["previous_response_id"],
+        "resp_stream_idle_1"
+    );
+}
+
+#[tokio::test]
 async fn responses_route_streams_previous_response_not_found_when_reconnect_fails() {
     let connect_calls = Arc::new(AtomicUsize::new(0));
     let first_socket = SharedUpstreamWebsocket::scripted(vec![
@@ -1649,11 +1933,9 @@ async fn responses_route_stateful_stream_yields_first_chunk_before_completion() 
         .expect("completed chunk")
         .expect("completed chunk result")
         .expect("completed chunk bytes");
-    assert!(
-        String::from_utf8(rest.to_vec())
-            .expect("utf8 completed")
-            .contains("\"type\":\"response.completed\"")
-    );
+    assert!(String::from_utf8(rest.to_vec())
+        .expect("utf8 completed")
+        .contains("\"type\":\"response.completed\""));
 }
 
 #[tokio::test]
@@ -1725,7 +2007,7 @@ async fn responses_route_stateful_stream_continues_after_internal_tool_follow_up
         else {
             break;
         };
-        body.push_str(&String::from_utf8(chunk.to_vec()).expect("utf8 chunk"));
+        body.push_str(core::str::from_utf8(&chunk).expect("utf8 chunk"));
         if body.contains("resp_after_stream_tool")
             && body.contains("\"type\":\"response.completed\"")
         {
@@ -1854,11 +2136,9 @@ async fn responses_route_stateful_stream_drains_after_client_disconnect_to_compl
         .expect("first chunk")
         .expect("first chunk result")
         .expect("first chunk bytes");
-    assert!(
-        String::from_utf8(first_chunk.to_vec())
-            .expect("utf8 first")
-            .contains("\"type\":\"response.created\"")
-    );
+    assert!(String::from_utf8(first_chunk.to_vec())
+        .expect("utf8 first")
+        .contains("\"type\":\"response.created\""));
     drop(first_response);
 
     release_completion.notify_waiters();
