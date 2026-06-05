@@ -299,7 +299,7 @@ impl SharedUpstreamWebsocket {
                 match frame {
                     Some(Message::Text(text)) => return Ok(Some(text.to_string())),
                     Some(Message::Binary(bytes)) => {
-                        return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+                        return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
                     }
                     Some(Message::Ping(payload)) => {
                         stream.send(Message::Pong(payload)).await?;
@@ -369,6 +369,7 @@ pub async fn send_responses_create_request(
     payload: Value,
     job_manager: Option<Arc<JobManager>>,
 ) -> Result<UpstreamResponse, Response> {
+    const ROUTE: &str = "http_nonstream";
     let socket = connector
         .connect(ResponsesWebsocketConnectContext::compatibility(session_id))
         .await
@@ -376,33 +377,66 @@ pub async fn send_responses_create_request(
 
     let outbound = serde_json::to_string(&websocket_request_payload(payload))
         .expect("responses websocket payload json");
-    socket
-        .send_text(outbound)
-        .await
-        .map_err(|error| websocket_gateway_error("Upstream websocket request failed", error))?;
+    if let Err(error) = socket.send_text(outbound).await {
+        tracing::warn!(route = ROUTE, error = %error, "upstream_send_failed");
+        return Err(websocket_gateway_error(
+            "Upstream websocket request failed",
+            error,
+        ));
+    }
 
     let mut body = String::new();
     let mut response_buffer = String::new();
     let mut current_response_id = None;
     let mut pending_internal_outputs = Vec::new();
-    while let Some(message) = socket
-        .recv_text()
-        .await
-        .map_err(|error| websocket_gateway_error("Upstream websocket receive failed", error))?
-    {
+    loop {
+        let message = match socket.recv_text().await {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(route = ROUTE, error = %error, "upstream_receive_failed");
+                return Err(websocket_gateway_error(
+                    "Upstream websocket receive failed",
+                    error,
+                ));
+            }
+        };
+
+        let Some(message) = message else {
+            tracing::warn!(route = ROUTE, "upstream_socket_closed");
+            tracing::debug!(
+                route = ROUTE,
+                reason = "upstream_socket_closed",
+                "loop_break"
+            );
+            break;
+        };
+
+        trace_upstream_event(ROUTE, &message);
         if let Some(response_id) = websocket_message_response_id(&message) {
             current_response_id = Some(response_id);
         }
         if let Some(output) =
-            maybe_intercept_chatmock_job_tool_call(job_manager.as_ref(), &message).await?
+            maybe_intercept_chatmock_job_tool_call(ROUTE, job_manager.as_ref(), &message).await?
         {
             pending_internal_outputs.push(output);
+            tracing::debug!(
+                route = ROUTE,
+                pending_count = pending_internal_outputs.len(),
+                "internal_tool_output_pending"
+            );
             continue;
         }
 
         if let Some(metadata) = websocket_event_metadata(&message) {
             if metadata.completed && !pending_internal_outputs.is_empty() {
+                tracing::debug!(
+                    route = ROUTE,
+                    response_id = metadata.response_id.as_deref(),
+                    pending_count = pending_internal_outputs.len(),
+                    "intermediate_response_completed"
+                );
                 send_pending_internal_tool_follow_up(
+                    ROUTE,
                     &socket,
                     metadata
                         .response_id
@@ -421,6 +455,24 @@ pub async fn send_responses_create_request(
 
         if websocket_terminal_event(&message) {
             body.push_str(&response_buffer);
+            if let Some(metadata) = websocket_event_metadata(&message) {
+                if metadata.completed {
+                    tracing::debug!(
+                        route = ROUTE,
+                        response_id = metadata.response_id.as_deref(),
+                        "final_response_completed"
+                    );
+                }
+                tracing::debug!(
+                    route = ROUTE,
+                    completed = metadata.completed,
+                    failed = metadata.failed,
+                    errored = metadata.errored,
+                    "loop_break"
+                );
+            } else {
+                tracing::debug!(route = ROUTE, reason = "terminal_event", "loop_break");
+            }
             break;
         }
     }
@@ -440,6 +492,7 @@ pub async fn send_stateful_responses_create_request(
     previous_response_id: Option<&str>,
     job_manager: Option<Arc<JobManager>>,
 ) -> Result<UpstreamResponse, Response> {
+    const ROUTE: &str = "http_stateful";
     let lease = registry
         .acquire_async_with_metadata(previous_response_id, |metadata| async move {
             let context = ResponsesWebsocketConnectContext {
@@ -458,6 +511,7 @@ pub async fn send_stateful_responses_create_request(
     let outbound = serde_json::to_string(&websocket_request_payload(payload))
         .expect("responses websocket payload json");
     if let Err(error) = guard.lease().upstream_ws.send_text(outbound).await {
+        tracing::warn!(route = ROUTE, error = %error, "upstream_send_failed");
         return Err(websocket_gateway_error(
             "Upstream websocket request failed",
             error,
@@ -473,6 +527,7 @@ pub async fn send_stateful_responses_create_request(
         let message = match guard.lease().upstream_ws.recv_text().await {
             Ok(message) => message,
             Err(error) => {
+                tracing::warn!(route = ROUTE, error = %error, "upstream_receive_failed");
                 return Err(websocket_gateway_error(
                     "Upstream websocket receive failed",
                     error,
@@ -481,16 +536,28 @@ pub async fn send_stateful_responses_create_request(
         };
 
         let Some(message) = message else {
+            tracing::warn!(route = ROUTE, "upstream_socket_closed");
+            tracing::debug!(
+                route = ROUTE,
+                reason = "upstream_socket_closed",
+                "loop_break"
+            );
             break;
         };
 
+        trace_upstream_event(ROUTE, &message);
         if let Some(response_id) = websocket_message_response_id(&message) {
             retained_response_id = Some(response_id);
         }
         if let Some(output) =
-            maybe_intercept_chatmock_job_tool_call(job_manager.as_ref(), &message).await?
+            maybe_intercept_chatmock_job_tool_call(ROUTE, job_manager.as_ref(), &message).await?
         {
             pending_internal_outputs.push(output);
+            tracing::debug!(
+                route = ROUTE,
+                pending_count = pending_internal_outputs.len(),
+                "internal_tool_output_pending"
+            );
             continue;
         }
 
@@ -500,7 +567,14 @@ pub async fn send_stateful_responses_create_request(
                 retained_response_id = metadata.response_id.clone();
             }
             if metadata.completed && !pending_internal_outputs.is_empty() {
+                tracing::debug!(
+                    route = ROUTE,
+                    response_id = retained_response_id.as_deref(),
+                    pending_count = pending_internal_outputs.len(),
+                    "intermediate_response_completed"
+                );
                 send_pending_internal_tool_follow_up(
+                    ROUTE,
                     &guard.lease().upstream_ws,
                     retained_response_id.as_deref(),
                     &mut pending_internal_outputs,
@@ -518,13 +592,34 @@ pub async fn send_stateful_responses_create_request(
             if metadata.completed {
                 body.push_str(&response_buffer);
                 retain = retained_response_id.is_some();
+                tracing::debug!(
+                    route = ROUTE,
+                    response_id = retained_response_id.as_deref(),
+                    "final_response_completed"
+                );
                 if let Some(response_id) = retained_response_id.clone() {
+                    tracing::debug!(
+                        route = ROUTE,
+                        response_id = %response_id,
+                        "registry_mark_completed"
+                    );
                     guard.mark_completed(response_id);
                 }
+                tracing::debug!(
+                    route = ROUTE,
+                    reason = "final_response_completed",
+                    "loop_break"
+                );
                 break;
             }
             if metadata.failed || metadata.errored {
                 body.push_str(&response_buffer);
+                tracing::debug!(
+                    route = ROUTE,
+                    failed = metadata.failed,
+                    errored = metadata.errored,
+                    "loop_break"
+                );
                 break;
             }
         }
@@ -551,6 +646,7 @@ pub async fn send_stateful_responses_create_stream(
     stream_config: StatefulResponsesWebsocketStreamConfig,
     job_manager: Option<Arc<JobManager>>,
 ) -> Result<Response<Body>, Response> {
+    const ROUTE: &str = "stateful_sse";
     let lease = registry
         .acquire_async_with_metadata(previous_response_id, |metadata| async move {
             let context = ResponsesWebsocketConnectContext {
@@ -569,6 +665,7 @@ pub async fn send_stateful_responses_create_stream(
     let outbound = serde_json::to_string(&websocket_request_payload(payload))
         .expect("responses websocket payload json");
     if let Err(error) = guard.lease().upstream_ws.send_text(outbound).await {
+        tracing::warn!(route = ROUTE, error = %error, "upstream_send_failed");
         drop(guard);
         return Err(websocket_gateway_error(
             "Upstream websocket request failed",
@@ -610,32 +707,85 @@ fn stateful_sse_stream(
                 }
             } else {
                 let Some(deadline) = disconnect_deadline else {
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        reason = "downstream_closed_without_deadline",
+                        "loop_break"
+                    );
                     break;
                 };
                 let now = Instant::now();
                 if now >= deadline {
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        reason = "disconnect_drain_timeout",
+                        "loop_break"
+                    );
                     break;
                 }
                 match timeout(deadline - now, guard.lease().upstream_ws.recv_text()).await {
                     Ok(message) => message,
-                    Err(_) => break,
+                    Err(_) => {
+                        tracing::debug!(
+                            route = "stateful_sse",
+                            reason = "disconnect_drain_timeout",
+                            "loop_break"
+                        );
+                        break;
+                    }
                 }
             };
             let message = match message {
                 Ok(Some(message)) => message,
-                Ok(None) | Err(_) => break,
+                Ok(None) => {
+                    tracing::warn!(route = "stateful_sse", "upstream_socket_closed");
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        reason = "upstream_socket_closed",
+                        "loop_break"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(route = "stateful_sse", error = %error, "upstream_receive_failed");
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        reason = "upstream_receive_failed",
+                        "loop_break"
+                    );
+                    break;
+                }
             };
 
+            trace_upstream_event("stateful_sse", &message);
             if let Some(response_id) = websocket_message_response_id(&message) {
                 retained_response_id = Some(response_id);
             }
-            match maybe_intercept_chatmock_job_tool_call(job_manager.as_ref(), &message).await {
+            match maybe_intercept_chatmock_job_tool_call(
+                "stateful_sse",
+                job_manager.as_ref(),
+                &message,
+            )
+            .await
+            {
                 Ok(Some(output)) => {
                     pending_internal_outputs.push(output);
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        pending_count = pending_internal_outputs.len(),
+                        "internal_tool_output_pending"
+                    );
                     continue;
                 }
                 Ok(None) => {}
-                Err(_) => break,
+                Err(_) => {
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        reason = "internal_tool_error",
+                        "loop_break"
+                    );
+                    break;
+                }
             }
 
             let metadata = websocket_event_metadata(&message);
@@ -644,7 +794,14 @@ fn stateful_sse_stream(
                     retained_response_id = metadata.response_id.clone();
                 }
                 if metadata.completed && !pending_internal_outputs.is_empty() {
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        response_id = retained_response_id.as_deref(),
+                        pending_count = pending_internal_outputs.len(),
+                        "intermediate_response_completed"
+                    );
                     if send_pending_internal_tool_follow_up(
+                        "stateful_sse",
                         &guard.lease().upstream_ws,
                         retained_response_id.as_deref(),
                         &mut pending_internal_outputs,
@@ -652,6 +809,11 @@ fn stateful_sse_stream(
                     .await
                     .is_err()
                     {
+                        tracing::debug!(
+                            route = "stateful_sse",
+                            reason = "internal_tool_followup_failed",
+                            "loop_break"
+                        );
                         break;
                     }
                     retained_response_id = None;
@@ -669,12 +831,33 @@ fn stateful_sse_stream(
 
             if let Some(metadata) = metadata {
                 if metadata.completed {
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        response_id = retained_response_id.as_deref(),
+                        "final_response_completed"
+                    );
                     if let Some(response_id) = retained_response_id {
+                        tracing::debug!(
+                            route = "stateful_sse",
+                            response_id = %response_id,
+                            "registry_mark_completed"
+                        );
                         guard.mark_completed(response_id);
                     }
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        reason = "final_response_completed",
+                        "loop_break"
+                    );
                     break;
                 }
                 if metadata.failed || metadata.errored {
+                    tracing::debug!(
+                        route = "stateful_sse",
+                        failed = metadata.failed,
+                        errored = metadata.errored,
+                        "loop_break"
+                    );
                     break;
                 }
             }
@@ -703,6 +886,17 @@ fn tokio_stream_from_receiver<T: Send + 'static>(
     futures_util::stream::unfold(receiver, |mut receiver| async {
         receiver.recv().await.map(|item| (item, receiver))
     })
+}
+
+fn trace_upstream_event(route: &str, message: &str) {
+    let event_type = websocket_message_event_type(message);
+    let response_id = websocket_message_response_id(message);
+    tracing::trace!(
+        route,
+        event_type = event_type.as_deref(),
+        response_id = response_id.as_deref(),
+        "upstream_event_received"
+    );
 }
 
 fn websocket_gateway_error(message: &str, error: BoxedUpstreamWebsocketError) -> Response {
@@ -784,6 +978,17 @@ fn websocket_message_response_id(message: &str) -> Option<String> {
         .and_then(|value| event_response_id(&value))
 }
 
+fn websocket_message_event_type(message: &str) -> Option<String> {
+    serde_json::from_str::<Value>(message)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 fn event_response_id(value: &Value) -> Option<String> {
     value
         .get("response")
@@ -801,6 +1006,7 @@ struct PendingInternalToolOutput {
 }
 
 async fn maybe_intercept_chatmock_job_tool_call(
+    route: &str,
     job_manager: Option<&Arc<JobManager>>,
     message: &str,
 ) -> Result<Option<PendingInternalToolOutput>, Response> {
@@ -828,6 +1034,7 @@ async fn maybe_intercept_chatmock_job_tool_call(
         .or_else(|| item.get("id"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    tracing::debug!(route, name, call_id, "internal_tool_detected");
     let arguments = item
         .get("arguments")
         .and_then(Value::as_str)
@@ -848,6 +1055,7 @@ async fn maybe_intercept_chatmock_job_tool_call(
 }
 
 async fn send_pending_internal_tool_follow_up(
+    route: &str,
     socket: &SharedUpstreamWebsocket,
     previous_response_id: Option<&str>,
     pending_outputs: &mut Vec<PendingInternalToolOutput>,
@@ -862,6 +1070,7 @@ async fn send_pending_internal_tool_follow_up(
             .expect("internal tool error payload"),
         )
     })?;
+    let output_count = pending_outputs.len();
     let input = pending_outputs
         .drain(..)
         .map(|tool| {
@@ -881,8 +1090,21 @@ async fn send_pending_internal_tool_follow_up(
         .send_text(follow_up.to_string())
         .await
         .map_err(|error| {
+            tracing::warn!(
+                route,
+                previous_response_id,
+                output_count,
+                error = %error,
+                "upstream_send_failed"
+            );
             websocket_gateway_error("Upstream websocket internal tool follow-up failed", error)
         })?;
+    tracing::debug!(
+        route,
+        previous_response_id,
+        output_count,
+        "internal_tool_followup_sent"
+    );
     Ok(())
 }
 

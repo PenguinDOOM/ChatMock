@@ -163,10 +163,16 @@ async fn handle_responses_websocket(
         }
 
         let Some(active_upstream_socket) = upstream_socket.as_ref() else {
+            tracing::debug!(
+                route = "client_ws",
+                reason = "missing_upstream_socket",
+                "loop_break"
+            );
             break;
         };
 
         if let Err(error) = active_upstream_socket.send_text(outbound_text).await {
+            tracing::warn!(route = "client_ws", error = %error, "upstream_send_failed");
             let error_message = build_upstream_error(
                 Some("Upstream websocket request failed"),
                 UpstreamErrorContext {
@@ -191,6 +197,12 @@ async fn handle_responses_websocket(
             let upstream_message = match active_upstream_socket.recv_text().await {
                 Ok(Some(message)) => message,
                 Ok(None) => {
+                    tracing::warn!(route = "client_ws", "upstream_socket_closed");
+                    tracing::debug!(
+                        route = "client_ws",
+                        reason = "upstream_socket_closed",
+                        "loop_break"
+                    );
                     let error_message = build_upstream_error(
                         Some("Upstream websocket closed unexpectedly"),
                         UpstreamErrorContext::default(),
@@ -206,6 +218,12 @@ async fn handle_responses_websocket(
                     return;
                 }
                 Err(error) => {
+                    tracing::warn!(route = "client_ws", error = %error, "upstream_receive_failed");
+                    tracing::debug!(
+                        route = "client_ws",
+                        reason = "upstream_receive_failed",
+                        "loop_break"
+                    );
                     let error_message = build_upstream_error(
                         Some("Upstream websocket receive failed"),
                         UpstreamErrorContext {
@@ -225,6 +243,7 @@ async fn handle_responses_websocket(
                 }
             };
 
+            trace_upstream_event("client_ws", &upstream_message);
             if let Some(response_id) = websocket_message_response_id(&upstream_message) {
                 current_response_id = Some(response_id);
             }
@@ -232,6 +251,11 @@ async fn handle_responses_websocket(
                 maybe_intercept_chatmock_job_tool_call(&state, &upstream_message).await
             {
                 pending_internal_outputs.push(output);
+                tracing::debug!(
+                    route = "client_ws",
+                    pending_count = pending_internal_outputs.len(),
+                    "internal_tool_output_pending"
+                );
                 continue;
             }
 
@@ -241,8 +265,19 @@ async fn handle_responses_websocket(
                 }
                 if metadata.completed && !pending_internal_outputs.is_empty() {
                     let Some(previous_response_id) = current_response_id.as_deref() else {
+                        tracing::warn!(
+                            route = "client_ws",
+                            pending_count = pending_internal_outputs.len(),
+                            "intermediate_response_completed"
+                        );
                         continue;
                     };
+                    tracing::debug!(
+                        route = "client_ws",
+                        response_id = previous_response_id,
+                        pending_count = pending_internal_outputs.len(),
+                        "intermediate_response_completed"
+                    );
                     if let Err(error) = send_pending_internal_tool_follow_up(
                         active_upstream_socket,
                         previous_response_id,
@@ -250,6 +285,12 @@ async fn handle_responses_websocket(
                     )
                     .await
                     {
+                        tracing::warn!(
+                            route = "client_ws",
+                            previous_response_id,
+                            error = %error,
+                            "upstream_send_failed"
+                        );
                         let error_message = build_upstream_error(
                             Some("Upstream websocket internal tool follow-up failed"),
                             UpstreamErrorContext {
@@ -276,21 +317,37 @@ async fn handle_responses_websocket(
             response_buffer.push(upstream_message.clone());
 
             if websocket_terminal_event(&upstream_message) {
+                if let Some(metadata) = websocket_event_metadata(&upstream_message) {
+                    if metadata.completed {
+                        tracing::debug!(
+                            route = "client_ws",
+                            response_id = metadata.response_id.as_deref(),
+                            "final_response_completed"
+                        );
+                    }
+                }
                 for buffered_message in response_buffer.drain(..) {
                     if client_socket
                         .send(Message::Text(buffered_message.into()))
                         .await
                         .is_err()
                     {
+                        tracing::debug!(
+                            route = "client_ws",
+                            reason = "client_socket_closed",
+                            "loop_break"
+                        );
                         return;
                     }
                 }
+                tracing::debug!(route = "client_ws", reason = "terminal_event", "loop_break");
                 break;
             }
         }
     }
 
     if let Some(socket) = upstream_socket {
+        tracing::debug!(route = "client_ws", reason = "handler_end", "loop_break");
         crate::websocket::registry::RetainedUpstreamWebsocket::close_socket(&socket);
     }
 }
@@ -367,6 +424,28 @@ fn event_response_id(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn trace_upstream_event(route: &str, message: &str) {
+    let event_type = websocket_message_event_type(message);
+    let response_id = websocket_message_response_id(message);
+    tracing::trace!(
+        route,
+        event_type = event_type.as_deref(),
+        response_id = response_id.as_deref(),
+        "upstream_event_received"
+    );
+}
+
+fn websocket_message_event_type(message: &str) -> Option<String> {
+    serde_json::from_str::<Value>(message)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 #[derive(Debug)]
 struct WebsocketEventMetadata {
     response_id: Option<String>,
@@ -417,6 +496,7 @@ async fn maybe_intercept_chatmock_job_tool_call(
         .or_else(|| item.get("id"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    tracing::debug!(route = "client_ws", name, call_id, "internal_tool_detected");
     let arguments = item
         .get("arguments")
         .and_then(Value::as_str)
@@ -442,6 +522,7 @@ async fn send_pending_internal_tool_follow_up(
     previous_response_id: &str,
     pending_outputs: &mut Vec<PendingInternalToolOutput>,
 ) -> Result<(), crate::websocket::upstream::BoxedUpstreamWebsocketError> {
+    let output_count = pending_outputs.len();
     let input = pending_outputs
         .drain(..)
         .map(|tool| {
@@ -457,7 +538,14 @@ async fn send_pending_internal_tool_follow_up(
         "previous_response_id": previous_response_id,
         "input": input
     });
-    upstream_socket.send_text(follow_up.to_string()).await
+    upstream_socket.send_text(follow_up.to_string()).await?;
+    tracing::debug!(
+        route = "client_ws",
+        previous_response_id,
+        output_count,
+        "internal_tool_followup_sent"
+    );
+    Ok(())
 }
 
 fn websocket_response_create_payload(payload: Value) -> Value {
