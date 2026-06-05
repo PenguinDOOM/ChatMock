@@ -201,10 +201,19 @@ struct ScriptedUpstreamWebsocketState {
 }
 
 struct LiveUpstreamWebsocketState {
-    stream: tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>>,
+    outbound_tx: mpsc::Sender<OutboundWsMessage>,
+    inbound_rx: tokio::sync::Mutex<mpsc::Receiver<Result<String, BoxedUpstreamWebsocketError>>>,
     turn_state: Option<String>,
     closed: AtomicBool,
     close_metadata: Mutex<Option<UpstreamCloseMetadata>>,
+}
+
+enum OutboundWsMessage {
+    Text(String),
+    #[allow(dead_code)]
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Close,
 }
 
 #[derive(Clone)]
@@ -263,13 +272,23 @@ impl SharedUpstreamWebsocket {
         stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
         turn_state: Option<String>,
     ) -> Self {
+        let (outbound_tx, outbound_rx) = mpsc::channel(32);
+        let (inbound_tx, inbound_rx) = mpsc::channel(32);
+        let state = Arc::new(LiveUpstreamWebsocketState {
+            outbound_tx,
+            inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+            turn_state,
+            closed: AtomicBool::new(false),
+            close_metadata: Mutex::new(None),
+        });
+        tokio::spawn(run_live_upstream_websocket_pump(
+            stream,
+            outbound_rx,
+            inbound_tx,
+            Arc::clone(&state),
+        ));
         Self {
-            backend: SharedUpstreamWebsocketBackend::Live(Arc::new(LiveUpstreamWebsocketState {
-                stream: tokio::sync::Mutex::new(Some(stream)),
-                turn_state,
-                closed: AtomicBool::new(false),
-                close_metadata: Mutex::new(None),
-            })),
+            backend: SharedUpstreamWebsocketBackend::Live(state),
         }
     }
 
@@ -284,16 +303,19 @@ impl SharedUpstreamWebsocket {
                 Ok(())
             }
             SharedUpstreamWebsocketBackend::Live(state) => {
-                let mut guard = state.stream.lock().await;
-                let Some(stream) = guard.as_mut() else {
+                if state.closed.load(Ordering::SeqCst) {
                     state.closed.store(true, Ordering::SeqCst);
                     return Err(std::io::Error::other("Upstream websocket is closed").into());
-                };
-                if let Err(error) = stream.send(Message::Text(message.into())).await {
-                    state.closed.store(true, Ordering::SeqCst);
-                    *guard = None;
-                    return Err(error.into());
                 }
+                state
+                    .outbound_tx
+                    .send(OutboundWsMessage::Text(message))
+                    .await
+                    .map_err(|_| {
+                        state.closed.store(true, Ordering::SeqCst);
+                        std::io::Error::other("Upstream websocket pump is closed")
+                    })?;
+                tracing::trace!("send_text_enqueued");
                 Ok(())
             }
         }
@@ -324,63 +346,17 @@ impl SharedUpstreamWebsocket {
                     None => return Ok(None),
                 }
             },
-            SharedUpstreamWebsocketBackend::Live(state) => loop {
-                let mut guard = state.stream.lock().await;
-                let Some(stream) = guard.as_mut() else {
-                    state.closed.store(true, Ordering::SeqCst);
-                    return Ok(None);
-                };
-                let frame = match stream.next().await {
-                    Some(Ok(frame)) => Some(frame),
-                    Some(Err(error)) => {
-                        state.closed.store(true, Ordering::SeqCst);
-                        *state
-                            .close_metadata
-                            .lock()
-                            .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
-                            code: None,
-                            reason: Some(error.to_string()),
-                        });
-                        *guard = None;
-                        return Err(error.into());
+            SharedUpstreamWebsocketBackend::Live(state) => {
+                let mut receiver = state.inbound_rx.lock().await;
+                match receiver.recv().await {
+                    Some(Ok(message)) => {
+                        tracing::trace!("recv_text_delivered");
+                        Ok(Some(message))
                     }
-                    None => None,
-                };
-                match frame {
-                    Some(Message::Text(text)) => return Ok(Some(text.to_string())),
-                    Some(Message::Binary(bytes)) => {
-                        return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
-                    }
-                    Some(Message::Ping(payload)) => {
-                        stream.send(Message::Pong(payload)).await?;
-                    }
-                    Some(Message::Pong(_)) | Some(Message::Frame(_)) => {}
-                    Some(Message::Close(frame)) => {
-                        state.closed.store(true, Ordering::SeqCst);
-                        *state
-                            .close_metadata
-                            .lock()
-                            .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
-                            code: frame.as_ref().map(|frame| frame.code),
-                            reason: frame.as_ref().map(|frame| frame.reason.to_string()),
-                        });
-                        *guard = None;
-                        return Ok(None);
-                    }
-                    None => {
-                        state.closed.store(true, Ordering::SeqCst);
-                        *state
-                            .close_metadata
-                            .lock()
-                            .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
-                            code: None,
-                            reason: None,
-                        });
-                        *guard = None;
-                        return Ok(None);
-                    }
+                    Some(Err(error)) => Err(error),
+                    None => Ok(None),
                 }
-            },
+            }
         }
     }
 
@@ -422,6 +398,135 @@ impl SharedUpstreamWebsocket {
     }
 }
 
+async fn run_live_upstream_websocket_pump(
+    mut stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    mut outbound_rx: mpsc::Receiver<OutboundWsMessage>,
+    inbound_tx: mpsc::Sender<Result<String, BoxedUpstreamWebsocketError>>,
+    state: Arc<LiveUpstreamWebsocketState>,
+) {
+    tracing::debug!("ws_pump_started");
+    loop {
+        tokio::select! {
+            outbound = outbound_rx.recv() => {
+                let Some(outbound) = outbound else {
+                    mark_live_upstream_closed(&state, None, None);
+                    break;
+                };
+                let frame = match outbound {
+                    OutboundWsMessage::Text(text) => outbound_ws_message_to_frame(OutboundWsMessage::Text(text)),
+                    OutboundWsMessage::Ping(payload) => outbound_ws_message_to_frame(OutboundWsMessage::Ping(payload)),
+                    OutboundWsMessage::Pong(payload) => outbound_ws_message_to_frame(OutboundWsMessage::Pong(payload)),
+                    OutboundWsMessage::Close => {
+                        mark_live_upstream_closed(&state, None, None);
+                        let _ = stream.close(None).await;
+                        break;
+                    }
+                };
+                if let Err(error) = stream.send(frame).await {
+                    let message = error.to_string();
+                    mark_live_upstream_error(&state, &message);
+                    let _ = inbound_tx
+                        .send(Err(std::io::Error::other(message).into()))
+                        .await;
+                    break;
+                }
+            }
+            frame = stream.next() => {
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        tracing::trace!("ws_pump_text_received");
+                        if inbound_tx.send(Ok(text.to_string())).await.is_err() {
+                            mark_live_upstream_closed(&state, None, None);
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        tracing::trace!("ws_pump_text_received");
+                        let message = String::from_utf8_lossy(&bytes).into_owned();
+                        if inbound_tx.send(Ok(message)).await.is_err() {
+                            mark_live_upstream_closed(&state, None, None);
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        tracing::trace!("ws_pump_ping_received");
+                        let pong = outbound_ws_message_to_frame(OutboundWsMessage::Pong(payload.to_vec()));
+                        if let Err(error) = stream.send(pong).await {
+                            let message = error.to_string();
+                            mark_live_upstream_error(&state, &message);
+                            let _ = inbound_tx
+                                .send(Err(std::io::Error::other(message).into()))
+                                .await;
+                            break;
+                        }
+                        tracing::trace!("ws_pump_pong_sent");
+                    }
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    Some(Ok(Message::Close(frame))) => {
+                        mark_live_upstream_closed(
+                            &state,
+                            frame.as_ref().map(|frame| frame.code),
+                            frame.as_ref().map(|frame| frame.reason.to_string()),
+                        );
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        let message = error.to_string();
+                        mark_live_upstream_error(&state, &message);
+                        let _ = inbound_tx
+                            .send(Err(std::io::Error::other(message).into()))
+                            .await;
+                        break;
+                    }
+                    None => {
+                        mark_live_upstream_closed(&state, None, None);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn outbound_ws_message_to_frame(message: OutboundWsMessage) -> Message {
+    match message {
+        OutboundWsMessage::Text(text) => Message::Text(text.into()),
+        OutboundWsMessage::Ping(payload) => Message::Ping(payload.into()),
+        OutboundWsMessage::Pong(payload) => Message::Pong(payload.into()),
+        OutboundWsMessage::Close => Message::Close(None),
+    }
+}
+
+fn mark_live_upstream_closed(
+    state: &LiveUpstreamWebsocketState,
+    code: Option<CloseCode>,
+    reason: Option<String>,
+) {
+    state.closed.store(true, Ordering::SeqCst);
+    let metadata = UpstreamCloseMetadata { code, reason };
+    tracing::warn!(
+        code = ?metadata.code,
+        reason = ?metadata.reason.as_deref(),
+        "ws_pump_closed"
+    );
+    *state
+        .close_metadata
+        .lock()
+        .expect("live close metadata lock") = Some(metadata);
+}
+
+fn mark_live_upstream_error(state: &LiveUpstreamWebsocketState, reason: &str) {
+    state.closed.store(true, Ordering::SeqCst);
+    *state
+        .close_metadata
+        .lock()
+        .expect("live close metadata lock") = Some(UpstreamCloseMetadata {
+        code: None,
+        reason: Some(reason.to_string()),
+    });
+    tracing::warn!(error = %reason, "ws_pump_error");
+}
+
 impl RetainedUpstreamWebsocket for SharedUpstreamWebsocket {
     fn close_socket(&self) {
         match &self.backend {
@@ -430,9 +535,7 @@ impl RetainedUpstreamWebsocket for SharedUpstreamWebsocket {
             }
             SharedUpstreamWebsocketBackend::Live(state) => {
                 state.closed.store(true, Ordering::SeqCst);
-                if let Ok(mut guard) = state.stream.try_lock() {
-                    *guard = None;
-                }
+                let _ = state.outbound_tx.try_send(OutboundWsMessage::Close);
                 *state
                     .close_metadata
                     .lock()
@@ -1202,6 +1305,13 @@ fn trace_upstream_event_after_retry(route: &str, message: &str) {
         response_id = response_id.as_deref(),
         "upstream_event_received_after_retry"
     );
+    if should_log_upstream_error_event(message) {
+        tracing::warn!(route, error_event = %message, "upstream_error_event");
+    }
+}
+
+fn should_log_upstream_error_event(message: &str) -> bool {
+    websocket_message_event_type(message).as_deref() == Some("error")
 }
 
 fn log_upstream_socket_closed(route: &str, socket: &SharedUpstreamWebsocket) {
@@ -1469,5 +1579,20 @@ fn websocket_request_payload(payload: Value) -> Value {
             "type": "response.create",
             "payload": other,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_log_upstream_error_event;
+
+    #[test]
+    fn upstream_error_event_body_is_loggable_after_retry() {
+        assert!(should_log_upstream_error_event(
+            r#"{"type":"error","error":{"message":"cannot continue"}}"#
+        ));
+        assert!(!should_log_upstream_error_event(
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#
+        ));
     }
 }

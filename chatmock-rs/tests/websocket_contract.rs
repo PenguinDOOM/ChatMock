@@ -13,12 +13,16 @@ use chatmock_rs::websocket::upstream::{
 use chatmock_rs::RuntimeConfig;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::task::yield_now;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{protocol::frame::coding::CloseCode, Message},
+    accept_async, connect_async,
+    tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Message,
+    },
 };
 
 #[derive(Debug)]
@@ -128,6 +132,29 @@ async fn wait_for_sent_messages(socket: &SharedUpstreamWebsocket, expected_len: 
     .expect("scripted websocket should send expected messages");
 }
 
+async fn live_upstream_socket_pair() -> (
+    SharedUpstreamWebsocket,
+    tokio::task::JoinHandle<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test upstream listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let accept_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("upstream should accept");
+        accept_async(stream)
+            .await
+            .expect("upstream websocket should accept")
+    });
+    let (client_stream, _) = connect_async(format!("ws://{address}"))
+        .await
+        .expect("client websocket should connect");
+    (
+        SharedUpstreamWebsocket::live(client_stream, None),
+        accept_task,
+    )
+}
+
 #[tokio::test]
 async fn scripted_upstream_websocket_retains_close_code_and_reason() {
     let socket = SharedUpstreamWebsocket::scripted(vec![ScriptedUpstreamReceive::close(
@@ -136,6 +163,87 @@ async fn scripted_upstream_websocket_retains_close_code_and_reason() {
     )]);
 
     let message = socket.recv_text().await.expect("receive should succeed");
+    let close = socket.close_metadata().expect("close metadata");
+
+    assert!(message.is_none());
+    assert_eq!(close.code, Some(CloseCode::Away));
+    assert_eq!(close.reason.as_deref(), Some("backend drained"));
+    assert!(socket.is_socket_closed());
+}
+
+#[tokio::test]
+async fn live_upstream_websocket_pump_answers_ping_while_idle() {
+    let (socket, accept_task) = live_upstream_socket_pair().await;
+    let mut upstream = accept_task.await.expect("accept task should finish");
+
+    upstream
+        .send(Message::Ping(vec![1, 2, 3].into()))
+        .await
+        .expect("upstream ping should send");
+
+    let pong = timeout(Duration::from_secs(1), async {
+        loop {
+            let frame = upstream
+                .next()
+                .await
+                .expect("upstream websocket should stay open")
+                .expect("upstream frame should be ok");
+            if let Message::Pong(payload) = frame {
+                return payload.to_vec();
+            }
+        }
+    })
+    .await
+    .expect("pump should answer ping while no recv_text caller is active");
+
+    assert_eq!(pong, vec![1, 2, 3]);
+    socket.close_socket();
+}
+
+#[tokio::test]
+async fn live_upstream_websocket_pump_delivers_text_through_recv_channel() {
+    let (socket, accept_task) = live_upstream_socket_pair().await;
+    let mut upstream = accept_task.await.expect("accept task should finish");
+
+    upstream
+        .send(Message::Text(
+            serde_json::to_string(&json!({"type": "response.created"}))
+                .expect("json text")
+                .into(),
+        ))
+        .await
+        .expect("upstream text should send");
+
+    let message = timeout(Duration::from_secs(1), socket.recv_text())
+        .await
+        .expect("recv_text should receive through pump")
+        .expect("recv_text should succeed")
+        .expect("text should be delivered");
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&message).expect("message json")["type"],
+        "response.created"
+    );
+    socket.close_socket();
+}
+
+#[tokio::test]
+async fn live_upstream_websocket_pump_retains_close_metadata() {
+    let (socket, accept_task) = live_upstream_socket_pair().await;
+    let mut upstream = accept_task.await.expect("accept task should finish");
+
+    upstream
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "backend drained".into(),
+        })))
+        .await
+        .expect("upstream close should send");
+
+    let message = timeout(Duration::from_secs(1), socket.recv_text())
+        .await
+        .expect("recv_text should observe close")
+        .expect("recv_text should succeed");
     let close = socket.close_metadata().expect("close metadata");
 
     assert!(message.is_none());
